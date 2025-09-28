@@ -20,8 +20,8 @@ import itertools
 from fractions import Fraction
 from scipy.special import logsumexp
 import types
-import sys
-sys.path.insert(0, "/Users/chrismader/Python/SLDS")
+# import sys
+# sys.path.insert(0, "/Users/chrismader/Python/SLDS")
 
 # switch of widgets before importing ssm
 import os
@@ -93,9 +93,13 @@ def import_factors():
     Returns a DataFrame indexed by datetime with those columns (when present).
     """
 
-    p5   = "/Users/chrismader/Python/SLDS/Data/F-F_Research_Data_5_Factors_2x3_daily.csv"
-    p3   = "/Users/chrismader/Python/SLDS/Data/F-F_Research_Data_Factors_daily.csv"
-    pmom = "/Users/chrismader/Python/SLDS/Data/F-F_Momentum_Factor_daily.csv"
+    # p5 = "/Users/chrismader/Python/SLDS/Data/FF_Research_Data_5_Factors_2x3_daily.csv"
+    # p3 = "/Users/chrismader/Python/SLDS/Data/F-F_Research_Data_Factors_daily.csv"
+    # pmom = "/Users/chrismader/Python/SLDS/Data/F-F_Momentum_Factor_daily.csv"
+
+    p5   = "Data/F-F_Research_Data_5_Factors_2x3_daily.csv"
+    p3   = "Data/F-F_Research_Data_Factors_daily.csv"
+    pmom = "Data/F-F_Momentum_Factor_daily.csv"
 
     def _read_ff(path):
         # find the header line (the first line that starts with a comma)
