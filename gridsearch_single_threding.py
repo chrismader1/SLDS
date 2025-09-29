@@ -26,11 +26,6 @@ import types
 # switch of widgets before importing ssm
 import os
 os.environ["TQDM_NOTEBOOK"] = "0"   # no notebook widget
-
-from joblib import Parallel, delayed
-for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
-    os.environ.setdefault(_k, "1")
-
 import tqdm
 import tqdm.auto as tqa
 from tqdm.std import tqdm as tqdm_std
@@ -44,6 +39,7 @@ tqa.trange = _trange_no_widget
 import ssm
 
 from rSLDS import *
+
 
 # --------------------------------------------------------------------------------------
 # Data import
@@ -165,15 +161,14 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
     success = 0
     combo_list = list(itertools.product(r_grid, batch_grid))
     combo_total = len(combo_list)
-    if verbose: 
-        print(f"combo_total= {combo_total}")
+    print(f"combo_total= {combo_total}")
 
-    '''
     for combo_idx, (r, b) in enumerate(combo_list, 1):
+        
+        # print(f"\n\n{'='*72}\n({combo_idx}/{combo_total}) Params: {r}; {b}\n{'='*72}")
 
         label = r.get("model_name", "unrestricted")
-        if verbose:
-            print(f"\n\n{'-'*72}\n({combo_idx}/{combo_total}) {label} | Params: {r};{b}\n{'-'*72}")
+        print(f"\n\n{'='*72}\n({combo_idx}/{combo_total}) {label} | Params: {r}; {b}\n{'='*72}")
 
         zhat_all, xhat_all, elbo_all = [], [], []
         zhat_cusum_all = []         # stitched CUSUM
@@ -218,13 +213,14 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
 
             # NO CUSUM FOR ACTUAL DATA
             zhat_cus = zhat.copy()
-            
+            '''
             # CUSUM overlay on the primary series ONLY (y column)
-            # y_cus = y_tr[:, 0] if y_tr.ndim == 2 else y_tr      # (T,)
-            # assert y_cus.ndim == 1, f"y_cus must be 1D, got {y_cus.shape}"
-            # zhat_cus = cusum_overlay(px.iloc[t0:end_t], y_cus, xhat, model, h_z)
-            # assert zhat_cus is not None, "cusum_overlay returned None"
-            # assert len(zhat_cus) == len(zhat), f"CUSUM length {len(zhat_cus)} != {len(zhat)}"
+            y_cus = y_tr[:, 0] if y_tr.ndim == 2 else y_tr      # (T,)
+            assert y_cus.ndim == 1, f"y_cus must be 1D, got {y_cus.shape}"
+            zhat_cus = cusum_overlay(px.iloc[t0:end_t], y_cus, xhat, model, h_z)
+            assert zhat_cus is not None, "cusum_overlay returned None"
+            assert len(zhat_cus) == len(zhat), f"CUSUM length {len(zhat_cus)} != {len(zhat)}"
+            '''
             
             
             # ---- Stitch (trim overlap for all streams except first batch)
@@ -317,7 +313,7 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         summary = evaluate_rSLDS_actual(
             y_valid, px_valid, zhat_cusum_all, xhat_all, elbo_all, model, 
             cpll, max_cpll, dt, display=display)
-
+        
         # ---- CUSUM performance on the same stitched window
         c_rel_cus, c_str_cus, c_ben_cus, *_ = compute_score(px_valid, zhat_cusum_all, dt)
         summary["cagr_rel_cusum"] = c_rel_cus
@@ -385,258 +381,10 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         params=(r, b),
         summary=summary))
     
-    '''
-    
-    def _worker_run(combo_idx, r, b, verbose):
-        # NOTE: all variable names, logic, and comments below are preserved verbatim.
-        leaderboard_local = []
-        details_local = []
-        success_local = 0
-    
-        label = r.get("model_name", "unrestricted")
-        if verbose:
-            print(f"\n\n{'-'*72}\n({combo_idx}/{combo_total}) {label} | Params: {r};{b}\n{'-'*72}")
-    
-        zhat_all, xhat_all, elbo_all = [], [], []
-        zhat_cusum_all = []         # stitched CUSUM
-        zhat_pred_all = []          # ex-ante predictions stitched
-        pred_idx = []    # their absolute indices
-        retained_idx = []
-    
-        T = len(y)
-        t0 = 0
-        train_window = b["train_window"]
-        overlap = b["overlap_window"]
-    
-        while t0 < T:
-            end_t = min(t0 + train_window, T)
-            y_tr = y[t0:end_t]
-            y_tr = y_tr.reshape(-1, 1) if y_tr.ndim == 1 else y_tr
-    
-            # Fit model on batch (unrestricted vs restricted)
-            params = dict(
-                n_regimes=r["n_regimes"],
-                dim_latent=r["dim_latent"],
-                single_subspace=r.get("single_subspace", True),)
-            if r.get("restrictions") is not None:
-                R = r["restrictions"]
-                C = R["C"]    # shape (N_obs, D)
-                d = R["d"]    # shape (N_obs,)
-                bpat = R.get("b_pattern")      # e.g. ["mu_form"]*D
-                xhat, zhat, elbo, q, model = fit_rSLDS_restricted(
-                    y_tr, params, C, d, n_iter_em=n_iters, seed=seed, b_pattern=bpat, enforce_diag_A=True,
-                    C_mask=R.get("C_mask", None), d_mask=R.get("d_mask", None))
-            
-            else:
-                xhat, zhat, elbo, q, model = fit_rSLDS(y_tr, params, n_iter_em=n_iters, seed=seed)
-    
-            elbo_all.append(elbo)
-    
-            # boundary posterior for discrete-only seeding
-            mask_tr = np.ones_like(y_tr, dtype=bool) 
-            gamma_tr, *_ = model.expected_states(xhat, y_tr, mask=mask_tr)
-            gamma_T = gamma_tr[-1]  # (K,)
-    
-    
-            # NO CUSUM FOR ACTUAL DATA
-            zhat_cus = zhat.copy()
-            
-            # CUSUM overlay on the primary series ONLY (y column)
-            # y_cus = y_tr[:, 0] if y_tr.ndim == 2 else y_tr      # (T,)
-            # assert y_cus.ndim == 1, f"y_cus must be 1D, got {y_cus.shape}"
-            # zhat_cus = cusum_overlay(px.iloc[t0:end_t], y_cus, xhat, model, h_z)
-            # assert zhat_cus is not None, "cusum_overlay returned None"
-            # assert len(zhat_cus) == len(zhat), f"CUSUM length {len(zhat_cus)} != {len(zhat)}"
-            
-            
-            # ---- Stitch (trim overlap for all streams except first batch)
-            if t0 == 0:
-                zhat_all.append(zhat)
-                xhat_all.append(xhat)
-                zhat_cusum_all.append(zhat_cus)
-                retained_idx.extend(range(t0, end_t))
-            else:
-                overlap_eff = min(overlap, end_t - t0)
-                zhat_all.append(zhat[overlap_eff:])
-                xhat_all.append(xhat[overlap_eff:])
-                zhat_cusum_all.append(zhat_cus[overlap_eff:])
-                retained_idx.extend(range(t0 + overlap_eff, end_t))
-    
-            # ---- Ex-ante (discrete-only seed) on next overlap window
-            if (end_t < T) and (overlap > 0):
-                t2_end = min(end_t + overlap, T)
-                if t2_end > end_t:
-                    y_te = y[end_t:t2_end]
-                    y_te = y_te.reshape(-1, 1) if y_te.ndim == 1 else y_te
-            
-                    # save + seed discrete init only
-                    pi0_orig = getattr(model.init_state_distn, "pi", None)
-                    model.init_state_distn.pi = gamma_T / max(gamma_T.sum(), 1e-12)
-            
-                    # ssm posterior (no refit)
-                    T2   = len(y_te)
-                    Fs   = getattr(model.emissions, "Fs", [])
-                    D_in = Fs[0].shape[1] if len(Fs) else 0
-                    inputs2 = np.zeros((T2, D_in))
-                    mask2 = np.ones_like(y_te, dtype=bool)              # (T2, N)
-                    q_te = model._make_variational_posterior(
-                        variational_posterior="structured_meanfield",
-                        datas=[y_te], inputs=[inputs2], masks=[mask2], tags=[None], method="smf")
-                    xhat_te = q_te.mean_continuous_states[0]
-                    zhat_te = model.most_likely_states(xhat_te, y_te)
-            
-                    # restore
-                    if pi0_orig is not None:
-                        model.init_state_distn.pi = pi0_orig
-            
-                    zhat_pred_all.append(zhat_te)
-                    pred_idx.extend(range(end_t, t2_end))
-    
-            success_local += 1
-            if end_t == T:
-                pass
-                # break
-            t0 += train_window - overlap
-            if end_t == T:
-                break
-    
-        if not zhat_all:
-            return None
-    
-        # ---- Stitch + mask to data length
-        zhat_all = np.concatenate(zhat_all)
-        zhat_cusum_all = np.concatenate(zhat_cusum_all)
-        xhat_all = np.concatenate(xhat_all)
-        retained_idx = np.array(retained_idx)
-    
-        valid_mask = retained_idx < len(y)
-        retained_idx = retained_idx[valid_mask]
-        zhat_all = zhat_all[valid_mask]
-        xhat_all = xhat_all[valid_mask]
-        zhat_cusum_all = zhat_cusum_all[valid_mask]
-    
-        y_valid = y[retained_idx]
-        y_valid = y_valid.reshape(-1, 1) if y_valid.ndim == 1 else y_valid
-        px_valid = px.iloc[retained_idx]
-    
-        # ---- CPLL (smoothed) and rough upper bound
-        mask_valid = np.ones_like(y_valid, dtype=bool)      # (T,N)
-        gamma_valid, *_ = model.expected_states(xhat_all, y_valid, mask=mask_valid)
-        cpll = compute_smoothed_cpll(model, xhat_all, y_valid, gamma_valid)
-        if y_valid.shape[1] == 1:
-            v = float(np.var(y_valid[:, 0], ddof=1))
-            v = max(v, 1e-12)
-            entropy = 0.5 * np.log(2*np.pi*np.e*v)
-        else:
-            Sigma = np.cov(y_valid.T, ddof=1)
-            sign, logdet = np.linalg.slogdet(Sigma)
-            logdet = logdet if sign > 0 else np.log(1e-12)
-            N = y_valid.shape[1]
-            entropy = 0.5 * (N*np.log(2*np.pi*np.e) + logdet)        
-        max_cpll = -y_valid.shape[0] * entropy
-    
-        # ---- Plot overlay when lengths match (kept; not passed to evaluator)
-        overlays = {"CUSUM": zhat_cusum_all} if len(zhat_cusum_all) == len(zhat_all) else None
-        
-        # ---- Evaluation (now pass cpll & max_cpll)
-        summary = evaluate_rSLDS_actual(
-            y_valid, px_valid, zhat_cusum_all, xhat_all, elbo_all, model, 
-            cpll, max_cpll, dt, display=display)
-    
-        # ---- CUSUM performance on the same stitched window
-        c_rel_cus, c_str_cus, c_ben_cus, *_ = compute_score(px_valid, zhat_cusum_all, dt)
-        summary["cagr_rel_cusum"] = c_rel_cus
-        summary["cagr_strat_cusum"] = c_str_cus
-        summary["cagr_bench_cusum"] = c_ben_cus
-    
-        # ---- Ex-ante (live) performance on predicted overlap windows
-        if len(zhat_pred_all):
-            zhat_pred_all = np.concatenate(zhat_pred_all)
-            pred_idx = np.array(pred_idx)
-            if len(zhat_pred_all) == len(pred_idx):
-                px_pred = px.iloc[pred_idx]
-                c_rel_pred, c_str_pred, c_bench_pred, *_ = compute_score(px_pred, zhat_pred_all, dt)
-                summary["cagr_rel_ex_ante"] = c_rel_pred
-                summary["cagr_strat_ex_ante"] = c_str_pred
-                summary["cagr_bench_ex_ante"] = c_bench_pred
-    
-        # --- Niceness features
-        ncpll = float(cpll / max(max_cpll, 1e-12))
-        agree_cusum = float(np.mean(zhat_all[:len(zhat_cusum_all)] == zhat_cusum_all)) if len(zhat_cusum_all)==len(zhat_all) else np.nan
-        Lbar = summary.get("avg_inferred_regime_length", np.nan)
-        mode_usage = summary.get("mode_usage", None)
-        if isinstance(mode_usage, dict):
-            p_dom = float(max(mode_usage.values()))
-        elif hasattr(mode_usage, "__iter__"):
-            p_dom = float(np.max(mode_usage))
-        else:
-            p_dom = np.nan
-        dELBO = summary.get("elbo_delta (last run)", np.nan)
-        c_rel = summary.get("cagr_rel", np.nan)
-        c_rel_ex = summary.get("cagr_rel_ex_ante", np.nan)
-        
-        # --- Rule
-        nice = (
-            (Lbar >= 20) and
-            (agree_cusum >= 0.70 if not np.isnan(agree_cusum) else True) and
-            (ncpll >= 0.60) and
-            (dELBO >= 0) and
-            (c_rel >= 0) and
-            (np.isnan(c_rel_ex) or c_rel_ex >= 0)
-        )
-        difficult = (
-            (Lbar <= 5) or
-            (agree_cusum <= 0.55 if not np.isnan(agree_cusum) else False) or
-            (ncpll <= 0.40) or
-            (p_dom >= 0.90) or
-            ((c_rel < 0) and (not np.isnan(c_rel_ex) and c_rel_ex < 0))
-        )
-        tag = "nice" if nice else ("difficult" if difficult else "borderline")
-        
-        summary.update({
-            "ncpll": ncpll,
-            "agree_cusum": agree_cusum,
-            "p_dom": p_dom,
-            "niceness_tag": tag
-        })
-    
-        leaderboard_local.append(dict(score=summary["cagr_rel"], params=(r, b), summary=summary))
-    
-        details_local.append(dict(
-        zhat=zhat_all.copy(),
-        zhat_cusum=zhat_cusum_all.copy(),
-        retained_idx=np.array(retained_idx, int).copy(),
-        px_index=px_valid.index.copy(),
-        params=(r, b),
-        summary=summary))
-    
-        return leaderboard_local[0], details_local[0], success_local
-    
-    n_jobs = CONFIG.get("n_jobs", -1)
-    if n_jobs == 1 or len(combo_list) <= 1:
-        for combo_idx, (r, b) in enumerate(combo_list, 1):
-            _out = _worker_run(combo_idx, r, b, verbose)
-            if _out is None:
-                continue
-            _leader, _detail, _succ = _out
-            leaderboard.append(_leader)
-            details.append(_detail)
-            success += _succ
-    else:
-        _results = Parallel(n_jobs=n_jobs, prefer="processes")(
-            delayed(_worker_run)(combo_idx, r, b, verbose)
-            for combo_idx, (r, b) in enumerate(combo_list, 1)
-        )
-        for _out in _results:
-            if _out is None:
-                continue
-            _leader, _detail, _succ = _out
-            leaderboard.append(_leader)
-            details.append(_detail)
-            success += _succ
-
+    print("\nfits succeeded:", success)
     if leaderboard:
         sorted_leaderboard = sorted(leaderboard, key=lambda d: d["score"], reverse=True)
+        print("\nLEADERBOARD:")
         rows = []
         for i, entry in enumerate(sorted_leaderboard, 1):
             r, b = entry["params"]
@@ -681,15 +429,14 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         
         df = pd.DataFrame(rows)
 
-        if verbose: 
-            print("\nfits succeeded:", success)
-            print("\nLEADERBOARD:")
-            print_cols_all = ['rank','score','n_regimes','dim_latent','single_subspace','model_name']
-            print_cols = [c for c in print_cols_all if c in df.columns]
-            print(df[print_cols].to_string(index=False))
+        print_cols_all = ['rank','score','n_regimes','dim_latent','single_subspace','model_name']
+        print_cols = [c for c in print_cols_all if c in df.columns]
+        print(df[print_cols].to_string(index=False))
 
+        
         return df, details
 
+    
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
@@ -995,8 +742,7 @@ def pipeline_actual(securities, CONFIG, filename):
     # canonical series helper (per security)
     for security in securities:
 
-        if verbose:
-            print(f"\n\n{'='*72}\n{security}\n{'='*72}")
+        print(f"\n\n{'='*72}\n{security}\n{'='*72}")
 
         # remove nans
         ser_px = px_all[security].dropna()
@@ -1049,8 +795,7 @@ def pipeline_actual(securities, CONFIG, filename):
                 needed = [series_by_key[k] for k in chans]
                 common_idx = _intersect_indexes(needed)
                 if common_idx.empty:
-                    if verbose:
-                        print(f"[WARN] {security} {case['label']}: no overlap across requested channels; skipping.")
+                    print(f"[WARN] {security} {case['label']}: no overlap across requested channels; skipping.")
                     continue
         
                 y_cols = [series_by_key[k].loc[common_idx].values.reshape(-1, 1) for k in chans]
@@ -1081,8 +826,7 @@ def pipeline_actual(securities, CONFIG, filename):
                 for s in needed[1:]:
                     common_idx = common_idx.intersection(s.index)
                 if common_idx.empty:
-                    if verbose:
-                        print(f"[WARN] {security} {model_def['label']}: no overlap; skipping.")
+                    print(f"[WARN] {security} {model_def['label']}: no overlap; skipping.")
                     continue
         
                 Y_obs = np.concatenate([series_by_key[k].loc[common_idx].values.reshape(-1,1)
@@ -1111,8 +855,7 @@ def pipeline_actual(securities, CONFIG, filename):
                 base_channels = list(model_def["channels"])
                 missing = [k for k in base_channels if k not in series_by_key]
                 if missing:
-                    if verbose:
-                        print(f"[WARN] {security} {model_def['label']}: missing series {missing}; skipping.")
+                    print(f"[WARN] {security} {model_def['label']}: missing series {missing}; skipping.")
                     continue
 
                 needed = [series_by_key[k].dropna() for k in base_channels]
@@ -1120,8 +863,7 @@ def pipeline_actual(securities, CONFIG, filename):
                 for s in needed[1:]:
                     common_idx = common_idx.intersection(s.index)
                 if common_idx.empty:
-                    if verbose:
-                        print(f"[WARN] {security} {model_def['label']}: no overlap; skipping.")
+                    print(f"[WARN] {security} {model_def['label']}: no overlap; skipping.")
                     continue
 
                 Y_obs = np.concatenate([series_by_key[k].loc[common_idx].values.reshape(-1,1)
