@@ -1347,15 +1347,12 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
     else:
         elbo_start = elbo_end = elbo_delta = np.nan
 
-    '''
-    # ELBO (last run)
-    if elbo is not None and len(elbo):
-        elbo_start = elbo[-1][0]
-        elbo_end   = elbo[-1][-1]
-        elbo_delta = elbo_end - elbo_start
-    else:
-        elbo_start = elbo_end = elbo_delta = np.nan
-    '''
+    # CPLL across runs (supports scalar or list-of-scalars)
+    cpll_all = np.atleast_1d(cpll).astype(float)
+    max_cpll_all = np.atleast_1d(max_cpll).astype(float)
+    i_star = int(np.nanargmax(cpll_all))
+    cpll_best = float(cpll_all[i_star])
+    max_cpll_paired = float(max_cpll_all[i_star])
         
     # Performance
     cagr_rel, cagr_strat, cagr_bench, strategy_index, bench_index, hyp_result = compute_score(px, zhat, dt)
@@ -1374,8 +1371,8 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
         "cagr_bench": cagr_bench,
         "stability_margins": stability_margins,
         "stability_decision": stability_decision,
-        "cpll": cpll,
-        "max_cpll": max_cpll,
+        "cpll (max all runs)": cpll_best,
+        "max cpll (proxy bound, paired)": max_cpll_paired,
     }
 
     if display:
@@ -1440,8 +1437,8 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
 
         print("\nCPLL")
         print("----")
-        print(f"CPLL (stitched)   : {cpll:.1f}")
-        print(f"Upper bound       : {max_cpll:.1f}")
+        print(f"CPLL (best run)   : {cpll_best:.1f}")
+        print(f"Upper bound       : {max_cpll_paired:.1f}")
 
     return summary
 

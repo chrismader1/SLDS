@@ -179,6 +179,8 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
             print(f"\n\n{'-'*72}\n({combo_idx}/{combo_total}) {label} | Params: {r};{b}\n{'-'*72}")
     
         zhat_all, xhat_all, elbo_all = [], [], []
+        cpll_all = []
+        max_cpll_all = []
         zhat_cusum_all = []         # stitched CUSUM
         zhat_pred_all = []          # ex-ante predictions stitched
         pred_idx = []    # their absolute indices
@@ -312,6 +314,8 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
             N = y_valid.shape[1]
             entropy = 0.5 * (N*np.log(2*np.pi*np.e) + logdet)        
         max_cpll = -y_valid.shape[0] * entropy
+        cpll_all.append(float(cpll))
+        max_cpll_all.append(float(max_cpll))
     
         # ---- Plot overlay when lengths match (kept; not passed to evaluator)
         overlays = {"CUSUM": zhat_cusum_all} if len(zhat_cusum_all) == len(zhat_all) else None
@@ -319,7 +323,7 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         # ---- Evaluation (now pass cpll & max_cpll)
         summary = evaluate_rSLDS_actual(
             y_valid, px_valid, zhat_cusum_all, xhat_all, elbo_all, model, 
-            cpll, max_cpll, dt, display=display)
+            cpll_all, max_cpll_all, dt, display=display)
     
         # ---- CUSUM performance on the same stitched window
         c_rel_cus, c_str_cus, c_ben_cus, *_ = compute_score(px_valid, zhat_cusum_all, dt)
@@ -340,6 +344,10 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
     
         # --- Niceness features
         ncpll = float(cpll / max(max_cpll, 1e-12))
+        ncpll = float(
+            summary.get("cpll (max all runs)", np.nan) / max(
+                summary.get("max cpll (proxy bound, paired)", np.nan), 1e-12))
+
         agree_cusum = float(np.mean(zhat_all[:len(zhat_cusum_all)] == zhat_cusum_all)) if len(zhat_cusum_all)==len(zhat_all) else np.nan
         Lbar = summary.get("avg_inferred_regime_length", np.nan)
         mode_usage = summary.get("mode_usage", None)
@@ -1052,6 +1060,8 @@ def seed_stability_from_config(cfg, securities, filename):
         out = inference_rSLDS(px=None, mdl=mdl, y_test=Y, dt=dt, display=False)
         Z_pre_list.append(out["zhat"])
         X_pre_list.append(out["xhat"])
+        cpll_runs.append(float(out["cpll"]))
+        max_cpll_runs.append(float(out["max_cpll"]))
 
     # --------- 5) regime alignment (Hungarian) on params ----------
     def _extract(m):
