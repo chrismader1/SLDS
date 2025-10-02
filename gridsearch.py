@@ -89,6 +89,7 @@ def import_data(filename):
 
 
 def import_factors():
+    
     """
     Load Fama–French daily files you provided, using their exact column names:
     - F-F_Research_Data_5_Factors_2x3_daily.csv  -> Mkt-RF, SMB, HML, RMW, CMA, RF
@@ -97,13 +98,11 @@ def import_factors():
     Returns a DataFrame indexed by datetime with those columns (when present).
     """
 
-    # p5 = "/Users/chrismader/Python/SLDS/Data/FF_Research_Data_5_Factors_2x3_daily.csv"
-    # p3 = "/Users/chrismader/Python/SLDS/Data/F-F_Research_Data_Factors_daily.csv"
-    # pmom = "/Users/chrismader/Python/SLDS/Data/F-F_Momentum_Factor_daily.csv"
-
-    p5   = "Data/F-F_Research_Data_5_Factors_2x3_daily.csv"
-    p3   = "Data/F-F_Research_Data_Factors_daily.csv"
-    pmom = "Data/F-F_Momentum_Factor_daily.csv"
+    dir_path = filename if filename.endswith("/") else filename[: filename.rfind("/") + 1] if "/" in p else ""
+    
+    p5   = dir_path + "F-F_Research_Data_5_Factors_2x3_daily.csv"
+    p3   = dir_path + "F-F_Research_Data_Factors_daily.csv"
+    pmom = dir_path + "F-F_Momentum_Factor_daily.csv"
 
     def _read_ff(path):
         # find the header line (the first line that starts with a comma)
