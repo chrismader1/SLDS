@@ -701,7 +701,7 @@ def _append_segments(path, security, config_label, details):
 # Pipeline
 # --------------------------------------------------------------------------------------
 
-def pipeline_actual(securities, CONFIG, filename):
+def pipeline_actual(securities, CONFIG, filename, out_path):
     """
     - Imports data via import_data (VIX from IDX_PX).
     - Unrestricted path -> original 4 cases (|Ω|≈0..3), passing h_z through.
@@ -731,7 +731,7 @@ def pipeline_actual(securities, CONFIG, filename):
         Idx[security] = idx_dt
     
     # output CSV
-    gridsearch_csv = "gridsearch_results.csv"
+    gridsearch_csv = out_path + "gridsearch_results.csv"
     columns = [
         "security", "config", "rank", "score", "dt",
         "n_regimes", "dim_latent", "single_subspace",
@@ -743,7 +743,7 @@ def pipeline_actual(securities, CONFIG, filename):
     pd.DataFrame(columns=columns).to_csv(gridsearch_csv, index=False)
 
     # segments store (for stitched labels)
-    segments_csv = "gridsearch_segments.csv"
+    segments_csv = out_path + "gridsearch_segments.csv"
     pd.DataFrame(columns=["security","config","date","t","z"]).to_csv(segments_csv, index=False)
 
     # import data
