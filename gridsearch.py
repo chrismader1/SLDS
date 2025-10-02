@@ -88,7 +88,7 @@ def import_data(filename):
     return px_all, eps_all, pe_all, ser_vix
 
 
-def import_factors():
+def import_factors(dir_path = "/content/drive/MyDrive/Colab Notebooks/SLDS/Data/"):
     
     """
     Load Fama–French daily files you provided, using their exact column names:
@@ -97,8 +97,6 @@ def import_factors():
     - F-F_Momentum_Factor_daily.csv              -> Mom
     Returns a DataFrame indexed by datetime with those columns (when present).
     """
-
-    dir_path = filename if filename.endswith("/") else filename[: filename.rfind("/") + 1] if "/" in p else ""
     
     p5   = dir_path + "F-F_Research_Data_5_Factors_2x3_daily.csv"
     p3   = dir_path + "F-F_Research_Data_Factors_daily.csv"
