@@ -1168,6 +1168,7 @@ def evaluate_rSLDS_synthetic(prices, y, xhat, zhat, z_true, elbo, mdl, cpll, max
     # ELBO measures how well the estimated posterior q(z, x) fits the true posterior.
     # The closer q(z,x) is to the true posterior p(z,x|y), the smaller the KL divergence.
     # Bigger ELBO = smaller KL divergence = better q(z,x).
+    
     if elbo is not None:
         elbo_start = elbo[0] # first ELBO of last batch
         elbo_end = elbo[-1] # last ELBO of last batch
@@ -1338,6 +1339,15 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
     mode_usage = dict(Counter(zhat))
     smoothing = np.mean([len(list(g)) for _, g in groupby(zhat)])
 
+    # ELBO (all runs)
+    if elbo is not None and len(elbo):     
+        elbo_start = float(np.nanmin([run[0]  for run in elbo]))
+        elbo_end   = float(np.nanmax([run[-1] for run in elbo]))
+        elbo_delta = float(elbo_end - elbo_start)
+    else:
+        elbo_start = elbo_end = elbo_delta = np.nan
+
+    '''
     # ELBO (last run)
     if elbo is not None and len(elbo):
         elbo_start = elbo[-1][0]
@@ -1345,7 +1355,8 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
         elbo_delta = elbo_end - elbo_start
     else:
         elbo_start = elbo_end = elbo_delta = np.nan
-
+    '''
+        
     # Performance
     cagr_rel, cagr_strat, cagr_bench, strategy_index, bench_index, hyp_result = compute_score(px, zhat, dt)
 
@@ -1354,9 +1365,9 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
 
     summary = {
         "avg_inferred_regime_length": smoothing,
-        "elbo_start (last run)": elbo_start,
-        "elbo_end (last run)": elbo_end,
-        "elbo_delta (last run)": elbo_delta,
+        "elbo_start (min all runs)": elbo_start,
+        "elbo_end (max all runs)": elbo_end,
+        "elbo_delta (max all runs)": elbo_delta,
         "mode_usage": mode_usage,
         "cagr_rel": cagr_rel,
         "cagr_strat": cagr_strat,
@@ -1403,7 +1414,7 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
         # Summary print (mirror synthetic style)
         print("\n========== EVALUATION SUMMARY ==========")
         if elbo is not None:
-            print("\nELBO Diagnostics (last run)")
+            print("\nELBO Diagnostics (all runs)")
             print("----------------")
             print(f"ELBO start            : {elbo_start:.2f}")
             print(f"ELBO end              : {elbo_end:.2f}")
