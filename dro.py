@@ -4,9 +4,7 @@ import matplotlib.pyplot as plt
 import cvxpy as cp
 from scipy import stats
 from scipy.optimize import linear_sum_assignment
-# import sys
-# sys.path.insert(0, "/Users/chrismader/Python/SLDS")
-# from gridsearch import *
+from gridsearch import *
 
 # ---------------------------------------------------------------
 # Wasserstein helper functions
@@ -435,7 +433,7 @@ def evaluate_regime_independently(fit, data, G):
             #    (relies on the corrected stats_from_series from dro.py)
             seg_config = dict(G)
             seg_config["n_days"] = n_days
-            seg_config["annualization_factor"] = n_days
+            seg_config["annualization_factor"] = int(data.get("ann_factor", 252))
             
             # 3. Calculate statistics for this segment ONLY
             mu_seg, sigma_seg, sharpe_seg = stats_from_series(seg_series_oos, seg_config)
@@ -1030,7 +1028,7 @@ def _select_best_config(results_df, security, prefer_configs=None):
         return None
     return str(df.iloc[0]["config"])
 
-def _labels_from_segments_csv(segments_df, security, config):
+def _labels_from_segments_df(segments_df, security, config):
     df = segments_df[(segments_df["security"] == security) &
                      (segments_df["config"] == config)].copy()
     if df.empty:
@@ -1044,7 +1042,8 @@ def _labels_from_segments_csv(segments_df, security, config):
 # Pipeline
 # -------------------------
 
-def dro_pipeline(tickers, filename, out_path, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
+def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
+    
     import numpy as np, pandas as pd, hashlib, os
 
     # ---------- helpers (debug only) ----------
@@ -1076,9 +1075,15 @@ def dro_pipeline(tickers, filename, out_path, RSLDS_CONFIG, DRO_CONFIG, DELTA_DE
         te_np = te.to_numpy(dtype=float) if isinstance(te, pd.DataFrame) else np.asarray(te, float)
         print(f"[DEBUG:{tag}] sha(train)={_sha(tr_np)}  sha(test)={_sha(te_np)}")
 
+    def _resolve_rSLDS_outputs(RSLDS_CONFIG):
+        res_csv  = RSLDS_CONFIG["results_csv"]
+        seg_parq = RSLDS_CONFIG["segments_parquet"]
+        return res_csv, seg_parq
+
     # =========================================================
+    
     # 0) Panels
-    px_all, eps_all, pe_all, ser_vix = import_data(filename)
+    px_all, eps_all, pe_all, ser_vix = import_data(RSLDS_CONFIG["data_excel"])
 
     # 1) RETURNS calendar (UNION; PX-only; honours start/end)
     GIDX = build_calendar_union_px(
@@ -1100,7 +1105,7 @@ def dro_pipeline(tickers, filename, out_path, RSLDS_CONFIG, DRO_CONFIG, DELTA_DE
     dataA = make_data_from_returns_panel(R_use_clean)
 
     # Debug digest for the returns dataset (same in both modes)
-    print(f"[DEBUG:MODE] use_gridsearch_csv={bool(DRO_CONFIG.get('use_gridsearch_csv', False))}")
+    print(f"[DEBUG:MODE] run_gridsearch={bool(DRO_CONFIG.get('run_gridsearch', False))}")
     print(f"[DEBUG:R] R_use.shape={R_use.shape}  R_use_clean.shape={R_use_clean.shape}")
     print(f"[DEBUG:R] cols={list(R_use.columns)}")
     print(f"[DEBUG:R] index span: {R_use.index.min()} → {R_use.index.max()}  (len={len(R_use.index)})")
@@ -1115,32 +1120,90 @@ def dro_pipeline(tickers, filename, out_path, RSLDS_CONFIG, DRO_CONFIG, DELTA_DE
     assert len(fitA["w"]) == N, f"len(w)={len(fitA['w'])} != N={N} from DATA_A"
     summA = evaluate_portfolio({"type": "static", "w": fitA["w"]}, dataA, DRO_CONFIG["GLOBAL"])
 
-    # 4) rSLDS labels (CSV only affects labels, NOT returns/dataA)
+    # 4) rSLDS labels (CSV affects model selection; Parquet supplies segments)
     Z_labels = {}
-    if DRO_CONFIG.get("use_gridsearch_csv", False):
-        # Use exactly the paths provided; schema is fixed by your generator
-        res_path = DRO_CONFIG["gridsearch_results_csv"]
-        seg_path = DRO_CONFIG["gridsearch_segments_csv"]
-        
-        df_res = pd.read_csv(DRO_CONFIG["gridsearch_results_csv"])
-        df_seg = pd.read_csv(
-            DRO_CONFIG["gridsearch_segments_csv"],
-            usecols=["security","config","date","z"], parse_dates=["date"])
-        
-        for sec in tickers:
-            cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
-            if cfg_best is None:
-                print(f"[WARN] No CSV entry for {sec}; skipping."); continue
-            z_ser = _labels_from_segments_csv(df_seg, sec, cfg_best)
-            if z_ser is None:
-                print(f"[WARN] No segments for {sec} under config={cfg_best}; skipping."); continue
-            Z_labels[sec] = map_labels_to_calendar(z_ser, R_df_all.index)
-    else:
-        best = pipeline_actual(tickers, RSLDS_CONFIG, filename, out_path)
+    if DRO_CONFIG.get("run_gridsearch", False):
+        # Run fresh gridsearch (no file IO for labels)
+        best = pipeline_actual(tickers, RSLDS_CONFIG)
         for sec in tickers:
             if sec in best["Z_labels"]:
                 Z_labels[sec] = map_labels_to_calendar(best["Z_labels"][sec], R_df_all.index)
 
+    else:
+        # Reuse artifacts: CSV (results) + Parquet (segments), both from RSLDS_CONFIG
+        import os
+        res_csv, seg_parq = _resolve_rSLDS_outputs(RSLDS_CONFIG)
+    
+        if not os.path.exists(res_csv):
+            raise FileNotFoundError(f"Results CSV not found: {res_csv}")
+        if not os.path.exists(seg_parq):
+            raise FileNotFoundError(f"Segments Parquet not found: {seg_parq}")
+    
+        df_res = pd.read_csv(res_csv)
+        df_seg = pd.read_parquet(seg_parq)
+    
+        # --- STRICT ARTIFACT VALIDATION (Parquet only; no legacy CSV fallback) ---
+        required_cols = {"security", "config", "date", "z"}
+        missing_cols = required_cols - set(df_seg.columns)
+        if missing_cols:
+            raise ValueError(f"Segments parquet missing required columns: {missing_cols}")
+    
+        if df_seg["date"].dtype != "datetime64[ns]":
+            df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
+    
+        requested = set(tickers)
+        res_securities = set(df_res["security"].astype(str).unique())
+        missing_in_results = requested - res_securities
+        if missing_in_results:
+            raise ValueError(
+                "Requested tickers missing in gridsearch_results.csv: "
+                + ", ".join(sorted(missing_in_results))
+            )
+    
+        # ensure segment dates overlap eval calendar
+        gidx_norm = pd.DatetimeIndex(GIDX.normalize())
+        bad_no_config = []
+        bad_no_segments = []
+        bad_no_overlap = []
+    
+        for sec in tickers:
+            cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
+            if cfg_best is None:
+                bad_no_config.append(sec)
+                continue
+    
+            mask = (
+                (df_seg["security"].astype(str) == sec)
+                & (df_seg["config"].astype(str) == str(cfg_best))
+            )
+            if not mask.any():
+                bad_no_segments.append(f"{sec}[{cfg_best}]")
+                continue
+    
+            seg_dates = pd.DatetimeIndex(df_seg.loc[mask, "date"].dropna().unique())
+            if len(seg_dates) == 0 or gidx_norm.intersection(seg_dates.normalize()).empty:
+                bad_no_overlap.append(sec)
+    
+        errs = []
+        if bad_no_config:
+            errs.append("No winning config in results CSV for: " + ", ".join(sorted(bad_no_config)))
+        if bad_no_segments:
+            errs.append("No segment rows in parquet for: " + ", ".join(sorted(bad_no_segments)))
+        if bad_no_overlap:
+            errs.append(
+                "No date overlap between parquet segments and returns calendar for: "
+                + ", ".join(sorted(bad_no_overlap))
+            )
+        if errs:
+            raise ValueError("Artifact validation failed:\n - " + "\n - ".join(errs))
+        # --- END VALIDATION ---
+    
+        # Build Z_labels (helper works with a DataFrame loaded from parquet)
+        for sec in tickers:
+            cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
+            z_ser = _labels_from_segments_csv(df_seg, sec, cfg_best)  # <-- fixed helper name
+            Z_labels[sec] = map_labels_to_calendar(z_ser, R_df_all.index)
+    
     missing = [sec for sec in tickers if sec not in Z_labels]
     if missing:
         print(f"[WARN] Missing regimes for: {missing}. Dropped from pooled moments.")

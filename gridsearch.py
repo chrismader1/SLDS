@@ -20,8 +20,6 @@ import itertools
 from fractions import Fraction
 from scipy.special import logsumexp
 import types
-# import sys
-# sys.path.insert(0, "/Users/chrismader/Python/SLDS")
 
 # switch of widgets before importing ssm
 import os
@@ -44,6 +42,7 @@ tqa.trange = _trange_no_widget
 import ssm
 
 from rSLDS import *
+from io_manager import IOManager
 
 # --------------------------------------------------------------------------------------
 # Data import
@@ -88,7 +87,7 @@ def import_data(filename):
     return px_all, eps_all, pe_all, ser_vix
 
 
-def import_factors(dir_path = "/content/drive/MyDrive/Colab Notebooks/SLDS/Data/"):
+def import_factors(dir_path, ff_files):
     
     """
     Load Fama–French daily files you provided, using their exact column names:
@@ -97,11 +96,11 @@ def import_factors(dir_path = "/content/drive/MyDrive/Colab Notebooks/SLDS/Data/
     - F-F_Momentum_Factor_daily.csv              -> Mom
     Returns a DataFrame indexed by datetime with those columns (when present).
     """
-    
-    p5   = dir_path + "F-F_Research_Data_5_Factors_2x3_daily.csv"
-    p3   = dir_path + "F-F_Research_Data_Factors_daily.csv"
-    pmom = dir_path + "F-F_Momentum_Factor_daily.csv"
 
+    p5   = os.path.join(dir_path, ff_files["ff5"])
+    p3   = os.path.join(dir_path, ff_files["ff3"])
+    pmom = os.path.join(dir_path, ff_files["mom"])
+    
     def _read_ff(path):
         # find the header line (the first line that starts with a comma)
         with open(path, "r", encoding="latin1", errors="ignore") as f:
@@ -694,7 +693,7 @@ def _append_segments(path, security, config_label, details):
 # Pipeline
 # --------------------------------------------------------------------------------------
 
-def pipeline_actual(securities, CONFIG, filename, out_path):
+def pipeline_actual(securities, CONFIG):
     """
     - Imports data via import_data (VIX from IDX_PX).
     - Unrestricted path -> original 4 cases (|Ω|≈0..3), passing h_z through.
@@ -710,6 +709,30 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
     run_unrestricted = CONFIG["run_unrestricted"]
     run_restricted = CONFIG["run_restricted"]
 
+    # === IO paths from CONFIG ===
+    tmp_dir              = CONFIG["tmp_dir"]
+    results_csv_path     = CONFIG["results_csv"]
+    segments_parquet_path= CONFIG["segments_parquet"]
+    data_excel_path      = CONFIG["data_excel"]
+    
+    # === IO manager (temp CSV during runs; flush per security) ===
+    results_header_cols = [
+        "security", "config", "rank", "score", "dt",
+        "n_regimes", "dim_latent", "single_subspace",
+        "train_window", "overlap_window", "avg_inferred_regime_length",
+        "elbo_start (last run)", "elbo_end (last run)", "elbo_delta (last run)",
+        "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",
+        "cagr_rel_cusum", "cagr_strat_cusum", "cagr_bench_cusum",
+        "cagr_rel_ex_ante", "cagr_strat_ex_ante", "cagr_bench_ex_ante",
+    ]
+
+    # making sure CONFIG carries everything IOManager expects
+    CONFIG.setdefault("results_header_cols", results_header_cols)
+    CONFIG.setdefault("segments_header_cols", ("security","config","date","t","z"))
+    CONFIG.setdefault("tmp_results_fmt",  "{tmp_dir}/results_tmp_{security}.csv")
+    CONFIG.setdefault("tmp_segments_fmt", "{tmp_dir}/segments_tmp_{security}.csv")
+    io_mgr = IOManager(CONFIG)
+
     # store results
     Z_labels, Segs, Idx = {}, {}, {}
     def _stash_labels(security, details):
@@ -724,7 +747,7 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
         Idx[security] = idx_dt
     
     # output CSV
-    gridsearch_csv = out_path + "gridsearch_results.csv"
+    gridsearch_csv = results_csv_path
     columns = [
         "security", "config", "rank", "score", "dt",
         "n_regimes", "dim_latent", "single_subspace",
@@ -735,13 +758,9 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
     
     pd.DataFrame(columns=columns).to_csv(gridsearch_csv, index=False)
 
-    # segments store (for stitched labels)
-    segments_csv = out_path + "gridsearch_segments.csv"
-    pd.DataFrame(columns=["security","config","date","t","z"]).to_csv(segments_csv, index=False)
-
     # import data
-    px_all, eps_all, pe_all, ser_vix = import_data(filename)
-    ff_df = import_factors()
+    px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])
+    ff = import_factors(CONFIG["ff_dir"], CONFIG["ff_files"])
 
     # helper to append results
     def _append(security, cfg, df_res):
@@ -758,18 +777,30 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
         dt_val = CONFIG["dt"]
         dt_str = f"1/{int(round(1.0/dt_val))}" if dt_val > 0 else str(dt_val)
         out.insert(4, "dt", dt_str)
-    
-        # read current CSV (has the schema you wrote initially)
-        cur = pd.read_csv(gridsearch_csv)
-    
-        # ensure identical column order/schema; fill any missing with NaN
-        out = out.reindex(columns=cur.columns, fill_value=np.nan)
-    
-        # avoid concatenating with an empty frame (causes the FutureWarning)
-        if cur.empty:
-            out.to_csv(gridsearch_csv, index=False)
-        else:
-            pd.concat([cur, out], ignore_index=True).to_csv(gridsearch_csv, index=False)
+
+        # buffer to temp CSV (fast); master append happens at per-security flush
+        io_mgr.append_temp_results(security, out)
+
+    def _append_segments_tmp(security, config_label, details, io_mgr):
+        """
+        Minimal shim to keep call sites unchanged:
+        - _unused_path: kept for signature compatibility (ignored).
+        - Builds segments rows and appends to IOManager's per-security temp CSV.
+        """
+        if not details:
+            return
+        frames = []
+        for d in details:
+            idx = pd.DatetimeIndex(d["px_index"])
+            frames.append(pd.DataFrame({
+                "security": security,
+                "config":   config_label,
+                "date":     idx,
+                "t":        np.arange(len(idx), dtype=int),
+                "z":        np.asarray(d["zhat_cusum"], dtype=int),
+            }))
+        out = pd.concat(frames, ignore_index=True)
+        io_mgr.append_temp_segments(security, out)
 
     # canonical series helper (per security)
     for security in securities:
@@ -811,12 +842,18 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
             "g": log_eps.diff().dropna(), # diff log eps (eps log growth)
             "v": log_pe.diff().dropna(),  # log PE change
             "h": log_vix.diff().dropna(), # log VIX change
-            "mkt": ff_df["MKT"],
-            "smb": ff_df["SMB"],
-            "hml": ff_df["HML"],
-            "rmw": ff_df["RMW"],
-            "cma": ff_df["CMA"],
-            "mom": ff_df["MOM"],}
+        }
+
+        # add factor series only if present in the Fama–French DataFrame
+        for col, key in [
+            ("MKT", "mkt"),
+            ("SMB", "smb"),
+            ("HML", "hml"),
+            ("RMW", "rmw"),
+            ("CMA", "cma"),
+            ("MOM", "mom"),]:
+            if col in ff.columns:
+                series_by_key[key] = ff[col]
 
         K_grid = CONFIG["K_grid"]
         
@@ -843,7 +880,7 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
                 df, details = gridsearch_actual(y=Y_obs, px=px_case, r_grid=r_grid, CONFIG=CONFIG)
                 _append(security, cfg, df)
                 _stash_labels(security, details)
-                _append_segments(segments_csv, security, cfg, details)
+                _append_segments_tmp(security, cfg, details, io_mgr)
 
         # Restricted models
         if run_restricted:
@@ -879,7 +916,7 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
                 df, details = gridsearch_actual(Y_obs, px_case, r_grid, CONFIG)
                 _append(security, model_def["label"], df)
                 _stash_labels(security, details)
-                _append_segments(segments_csv, security, model_def["label"], details)
+                _append_segments_tmp(security, model_def["label"], details, io_mgr)
         
             # --- Factor models ---
             for model_def in CONFIG.get("restricted_models", []):
@@ -922,14 +959,16 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
                 df, details = gridsearch_actual(Y_obs, px_case, r_grid, CONFIG)
                 _append(security, model_def["label"], df)
                 _stash_labels(security, details)
-                _append_segments(segments_csv, security, model_def["label"], details)
+                _append_segments_tmp(security, model_def["label"], details, io_mgr)
+
+        # === flush this security to Drive (results CSV + segments Parquet) ===
+        io_mgr.flush_one_security(security)
 
     print("Gridsearch completed.\n")
 
     return {"Z_labels": Z_labels, "segments": Segs, "index": Idx,
-            "meta": {"dt": CONFIG["dt"], "K_grid": CONFIG["K_grid"], "batch_grid": CONFIG["batch_grid"]}}
-
-
+            "meta": {"dt": CONFIG["dt"], "K_grid": CONFIG["K_grid"], "batch_grid": CONFIG["batch_grid"],},}
+            
 # --------------------------------------------------------------------------------------
 # Eval
 # --------------------------------------------------------------------------------------
@@ -979,8 +1018,8 @@ def seed_stability_from_config(cfg, securities, filename):
     n_runs    = int(cfg.get("n_runs", 10))
 
     # --------- 1) data (helpers from gridsearch.py) ----------
-    px_all, eps_all, pe_all, ser_vix = import_data(filename)
-    ff = import_factors()
+    px_all, eps_all, pe_all, ser_vix = import_data(cfg["data_excel"])
+    ff = import_factors(cfg["ff_dir"], cfg["ff_files"])
 
     # per-security channel dict
     def _series_by_sec(sec):
