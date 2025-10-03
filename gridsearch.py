@@ -376,9 +376,9 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                 **r_clean, **b,
                 "avg_inferred_regime_length": s.get("avg_inferred_regime_length"),
                 "mode_usage": s.get("mode_usage"),
-                "elbo_start (last run)": s.get("elbo_start (last run)"),
-                "elbo_end (last run)": s.get("elbo_end (last run)"),
-                "elbo_delta (last run)": s.get("elbo_delta (last run)"),
+                "elbo_start (min all runs)": s.get("elbo_start (min all runs)"),
+                "elbo_end (max all runs)":   s.get("elbo_end (max all runs)"),
+                "elbo_delta (max all runs)": s.get("elbo_delta (max all runs)"),
                 "cpll (max all runs)": s.get("cpll (max all runs)"),
                 "max cpll (proxy bound, paired)": s.get("max cpll (proxy bound, paired)"),
                 "cagr_rel": s.get("cagr_rel"),
@@ -659,7 +659,7 @@ def pipeline_actual(securities, CONFIG):
         "security","config","rank","score","dt",
         "n_regimes","dim_latent","single_subspace",
         "train_window","overlap_window","avg_inferred_regime_length",
-        "elbo_start (last run)","elbo_end (last run)","elbo_delta (last run)",
+        "elbo_start (min all runs)","elbo_end (max all runs)","elbo_delta (max all runs)",
         "cpll (max all runs)","max cpll (proxy bound, paired)",
         "mode_usage","cagr_rel","cagr_strat","cagr_bench",
         "cagr_rel_cusum","cagr_strat_cusum","cagr_bench_cusum",
@@ -701,9 +701,11 @@ def pipeline_actual(securities, CONFIG):
         if df_res is None or len(df_res) == 0:
             return
         out = df_res.copy()
+        if out.shape[0] == 0:  # <— guard rows
+            return
         if out.dropna(axis=1, how="all").empty:
             return
-    
+        
         # add identifying columns
         out.insert(0, "security", security)
         out.insert(1, "config",   cfg)

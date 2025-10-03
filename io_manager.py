@@ -89,10 +89,14 @@ class IOManager:
         lock = FileLock(master_csv + ".lock")
         with lock:
             new_df = pd.read_csv(tmp_csv).reindex(columns=self.results_header_cols)
+            # —— SKIP if no rows ——
+            if new_df.shape[0] == 0:
+                return
     
             if os.path.exists(master_csv) and os.path.getsize(master_csv) > 0:
                 old_df = pd.read_csv(master_csv).reindex(columns=self.results_header_cols)
-                out = pd.concat([old_df, new_df], ignore_index=True)
+                # old_df may be 0-row too; concat handles it but we avoid the warning by short-circuiting
+                out = new_df if old_df.shape[0] == 0 else pd.concat([old_df, new_df], ignore_index=True)
             else:
                 out = new_df
     
@@ -111,11 +115,14 @@ class IOManager:
         with lock:
             new_df = pd.read_csv(tmp_csv)
             new_df = self._coerce_segments_schema(new_df)
+            # —— SKIP if no rows ——
+            if new_df.shape[0] == 0:
+                return
     
             if os.path.exists(parquet_path) and os.path.getsize(parquet_path) > 0:
                 old = pd.read_parquet(parquet_path, engine="pyarrow")
                 old = self._coerce_segments_schema(old)
-                df = pd.concat([old, new_df], ignore_index=True)
+                df = new_df if old.shape[0] == 0 else pd.concat([old, new_df], ignore_index=True)
             else:
                 df = new_df
     
@@ -125,27 +132,28 @@ class IOManager:
             pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp_out)
             os.replace(tmp_out, parquet_path)
 
-    
-    def flush_one_security(self, security):
-        # temp paths
+   def flush_one_security(self, security):
+        # Always remove tmp files—even if there’s nothing to append
         tmp_res = self._tmp_results(security)
         tmp_seg = self._tmp_segments(security)
     
-        # ---- RESULTS: append temp CSV -> master CSV (schema-safe) ----
+        # RESULTS
         if os.path.exists(tmp_res) and os.path.getsize(tmp_res) > 0:
-            # ensure temp is in exact schema/order before append (belt & braces)
-            df = pd.read_csv(tmp_res)
-            df = df.reindex(columns=self.results_header_cols)
-            df.to_csv(tmp_res, index=False)
-            # append payload (drops temp header if present, ensures master header)
-            self._append_csv_file_to_master(tmp_res, self.results_csv)
-            # remove temp
-            os.remove(tmp_res)
+            df = pd.read_csv(tmp_res).reindex(columns=self.results_header_cols)
+            if df.shape[0] > 0:
+                df.to_csv(tmp_res, index=False)
+                self._append_csv_file_to_master(tmp_res, self.results_csv)
+            os.remove(tmp_res)  # remove regardless
     
-        # ---- SEGMENTS: append temp CSV -> parquet ----
+        # SEGMENTS
         if os.path.exists(tmp_seg) and os.path.getsize(tmp_seg) > 0:
-            self._append_to_parquet(tmp_seg, self.segments_parquet)
-            os.remove(tmp_seg)
+            df = pd.read_csv(tmp_seg)
+            df = self._coerce_segments_schema(df)
+            if df.shape[0] > 0:
+                # re-save normalized, then append
+                df.to_csv(tmp_seg, index=False)
+                self._append_to_parquet(tmp_seg, self.segments_parquet)
+            os.remove(tmp_seg)  # remove regardless
 
     # ---------- reader ----------
     def read_segments_for_stock(self, security, parquet_path=None):
