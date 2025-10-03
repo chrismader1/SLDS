@@ -24,11 +24,6 @@ import types
 # switch of widgets before importing ssm
 import os
 os.environ["TQDM_NOTEBOOK"] = "0"   # no notebook widget
-
-from joblib import Parallel, delayed
-for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
-    os.environ.setdefault(_k, "1")
-
 import tqdm
 import tqdm.auto as tqa
 from tqdm.std import tqdm as tqdm_std
@@ -43,6 +38,11 @@ import ssm
 
 from rSLDS import *
 from io_manager import IOManager
+
+from joblib import Parallel, delayed
+for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
+    os.environ.setdefault(_k, "1")
+
 
 # --------------------------------------------------------------------------------------
 # Data import
@@ -691,7 +691,7 @@ def pipeline_actual(securities, CONFIG):
 
     # initialize results file only if missing/empty
     if (not os.path.exists(gridsearch_csv)) or (os.path.getsize(gridsearch_csv) == 0):
-        print(f"[GS][init] creating master results CSV: {gridsearch_csv}")
+        # print(f"[GS][init] creating master results CSV: {gridsearch_csv}")
         pd.DataFrame(columns=CONFIG["results_header_cols"]).to_csv(gridsearch_csv, index=False)
     
     # import data
@@ -701,11 +701,11 @@ def pipeline_actual(securities, CONFIG):
     # helper to append results
     def _append(security, cfg, df_res):
         if df_res is None or len(df_res) == 0:
-            print(f"[GS][append] {security} | {cfg} — empty df_res; skip")
+            # print(f"[GS][append] {security} | {cfg} — empty df_res; skip")
             return
         out = df_res.copy()
         if out.shape[0] == 0 or out.dropna(axis=1, how="all").empty:
-            print(f"[GS][append] {security} | {cfg} — no rows/cols; skip")
+            # print(f"[GS][append] {security} | {cfg} — no rows/cols; skip")
             return
     
         out.insert(0, "security", security)
@@ -720,12 +720,12 @@ def pipeline_actual(securities, CONFIG):
                 out[c] = pd.NA
         out = out[header]
     
-        print(f"[GS][append] {security} | {cfg} -> rows={len(out)} cols={len(out.columns)}")
+        # print(f"[GS][append] {security} | {cfg} -> rows={len(out)} cols={len(out.columns)}")
         io_mgr.append_temp_results(security, out)
     
     def _append_segments_tmp(security, config_label, details, io_mgr):
         if not details:
-            print(f"[GS][segments] {security} | {config_label} — no details; skip")
+            # print(f"[GS][segments] {security} | {config_label} — no details; skip")
             return
         frames = []
         for d in details:
@@ -738,7 +738,7 @@ def pipeline_actual(securities, CONFIG):
                 "z":        np.asarray(d["zhat_cusum"], dtype=int),
             }))
         out = pd.concat(frames, ignore_index=True)
-        print(f"[GS][segments] {security} | {config_label} -> rows={len(out)}")
+        # print(f"[GS][segments] {security} | {config_label} -> rows={len(out)}")
         io_mgr.append_temp_segments(security, out)
     
     # canonical series helper (per security)
@@ -901,9 +901,9 @@ def pipeline_actual(securities, CONFIG):
                 _append_segments_tmp(security, model_def["label"], details, io_mgr)
 
         # === flush this security to Drive (results CSV + segments Parquet) ===
-        print(f"[GS][flush] flushing security={security}")
+        # print(f"[GS][flush] flushing security={security}")
         io_mgr.flush_one_security(security)
-        print(f"[GS][flush] done security={security}")   
+        # print(f"[GS][flush] done security={security}")   
 
     print("Gridsearch completed.\n")
 

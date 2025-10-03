@@ -1096,17 +1096,19 @@ def _select_best_config(results_df, security, prefer_configs=None):
         return None
     return str(df.iloc[0]["config"])
 
-
 def _labels_from_segments_df(segments_df, security, config):
     df = segments_df[(segments_df["security"] == security) &
                      (segments_df["config"] == config)].copy()
     if df.empty:
         return None
-    df = df.sort_values("date")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values(["date", "z"])
+    # keep the last label for a duplicated date (choose policy if you want 'first')
+    df = df.drop_duplicates(subset="date", keep="last")
     return pd.Series(
         df["z"].astype(int).to_numpy(),
-        index=pd.DatetimeIndex(df["date"]), name="z",)
-
+        index=pd.DatetimeIndex(df["date"]),
+        name="z",)
 
 # -------------------------
 # Pipeline
