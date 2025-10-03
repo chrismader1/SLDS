@@ -1188,8 +1188,17 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         if not os.path.exists(seg_parq):
             raise FileNotFoundError(f"Segments Parquet not found: {seg_parq}")
 
-        df_res = pd.read_csv(res_csv, usecols=range(10), dtype={0: str, 1: str})
+        # read the first 10 columns, then select required cols
+        df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")  # tolerant parser
+        cols   = ["security", "config", "rank", "score"]
+        df_res = df_res[[c for c in cols if c in df_res.columns]].copy()
         df_seg = pd.read_parquet(seg_parq)
+
+        # Optional: normalize dtypes (helps sorting/selection later)
+        if "security" in df_res: df_res["security"] = df_res["security"].astype(str).str.strip()
+        if "config"   in df_res: df_res["config"]   = df_res["config"].astype(str).str.strip()
+        if "rank"     in df_res: df_res["rank"]     = pd.to_numeric(df_res["rank"], errors="coerce")
+        if "score"    in df_res: df_res["score"]    = pd.to_numeric(df_res["score"], errors="coerce")
 
         # schema + date type
         required_cols = {"security", "config", "date", "z"}

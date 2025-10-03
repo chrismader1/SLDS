@@ -414,18 +414,6 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
 # Helpers
 # --------------------------------------------------------------------------------------
 
-def _safe_cell(v):
-    import numpy as _np, json as _json
-    if isinstance(v, dict):
-        # compact JSON (no spaces). Still contains commas, so prefer string without commas.
-        # If you want to keep JSON, it will be quoted by pandas; otherwise use ';' join.
-        return _json.dumps(v, separators=(",", ":"))
-    if isinstance(v, (list, tuple, _np.ndarray)):
-        # render WITHOUT commas to avoid confusing CSV parser
-        arr = _np.asarray(v)
-        return _np.array2string(arr, separator=" ", max_line_width=10**9)
-    return v
-
 def _clean_elbo_runs(elbo_runs):
     """
     Take a list of 1D arrays/lists (one per batch/run).
@@ -640,28 +628,6 @@ def _params_key(r, b):
         "overlap_window": b.get("overlap_window"),
     }, sort_keys=True)
 
-def _append_segments(path, security, config_label, details):
-    """
-    Append stitched label rows to CSV without re-reading the whole file.
-    Keeps your schema: ["security","config","date","t","z"].
-    """
-    if not details:
-        return
-    frames = []
-    for d in details:
-        idx = pd.DatetimeIndex(d["px_index"])
-        frames.append(pd.DataFrame({
-            "security": security,
-            "config":   config_label,
-            "date":     idx,
-            "t":        np.arange(len(idx), dtype=int),
-            "z":        np.asarray(d["zhat_cusum"], dtype=int),
-        }))
-    out = pd.concat(frames, ignore_index=True)
-    # append-only; write header if file missing/empty
-    write_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
-    out.to_csv(path, mode="a", header=write_header, index=False)
-
 
 # --------------------------------------------------------------------------------------
 # Pipeline
@@ -725,8 +691,9 @@ def pipeline_actual(securities, CONFIG):
 
     # initialize results file only if missing/empty
     if (not os.path.exists(gridsearch_csv)) or (os.path.getsize(gridsearch_csv) == 0):
+        print(f"[GS][init] creating master results CSV: {gridsearch_csv}")
         pd.DataFrame(columns=CONFIG["results_header_cols"]).to_csv(gridsearch_csv, index=False)
-
+    
     # import data
     px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])
     ff = import_factors(CONFIG["ff_dir"], CONFIG["ff_files"])
@@ -734,41 +701,31 @@ def pipeline_actual(securities, CONFIG):
     # helper to append results
     def _append(security, cfg, df_res):
         if df_res is None or len(df_res) == 0:
+            print(f"[GS][append] {security} | {cfg} — empty df_res; skip")
             return
         out = df_res.copy()
-        if out.shape[0] == 0:  # <— guard rows
+        if out.shape[0] == 0 or out.dropna(axis=1, how="all").empty:
+            print(f"[GS][append] {security} | {cfg} — no rows/cols; skip")
             return
-        if out.dropna(axis=1, how="all").empty:
-            return
-        
-        # add identifying columns
+    
         out.insert(0, "security", security)
         out.insert(1, "config",   cfg)
         dt_val = CONFIG["dt"]
         dt_str = f"1/{int(round(1.0/dt_val))}" if dt_val > 0 else str(dt_val)
         out.insert(4, "dt", dt_str)
     
-        # force schema/order
         header = CONFIG["results_header_cols"]
         for c in header:
             if c not in out.columns:
                 out[c] = pd.NA
         out = out[header]
-        
-        # make object-y columns CSV-safe (no raw commas)
-        for col in ["mode_usage"]:
-            if col in out.columns:
-                out[col] = out[col].apply(_safe_cell)
-        
+    
+        print(f"[GS][append] {security} | {cfg} -> rows={len(out)} cols={len(out.columns)}")
         io_mgr.append_temp_results(security, out)
-
+    
     def _append_segments_tmp(security, config_label, details, io_mgr):
-        """
-        Minimal shim to keep call sites unchanged:
-        - _unused_path: kept for signature compatibility (ignored).
-        - Builds segments rows and appends to IOManager's per-security temp CSV.
-        """
         if not details:
+            print(f"[GS][segments] {security} | {config_label} — no details; skip")
             return
         frames = []
         for d in details:
@@ -781,8 +738,9 @@ def pipeline_actual(securities, CONFIG):
                 "z":        np.asarray(d["zhat_cusum"], dtype=int),
             }))
         out = pd.concat(frames, ignore_index=True)
+        print(f"[GS][segments] {security} | {config_label} -> rows={len(out)}")
         io_mgr.append_temp_segments(security, out)
-
+    
     # canonical series helper (per security)
     for security in securities:
 
@@ -943,7 +901,9 @@ def pipeline_actual(securities, CONFIG):
                 _append_segments_tmp(security, model_def["label"], details, io_mgr)
 
         # === flush this security to Drive (results CSV + segments Parquet) ===
+        print(f"[GS][flush] flushing security={security}")
         io_mgr.flush_one_security(security)
+        print(f"[GS][flush] done security={security}")   
 
     print("Gridsearch completed.\n")
 
