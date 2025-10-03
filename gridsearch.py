@@ -327,54 +327,6 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                 summary["cagr_rel_ex_ante"] = c_rel_pred
                 summary["cagr_strat_ex_ante"] = c_str_pred
                 summary["cagr_bench_ex_ante"] = c_bench_pred
-
-        '''
-        
-        # --- Niceness features
-        ncpll = float(cpll / max(max_cpll, 1e-12))
-        ncpll = float(
-            summary.get("cpll (max all runs)", np.nan) / max(
-                summary.get("max cpll (proxy bound, paired)", np.nan), 1e-12))
-
-        agree_cusum = float(np.mean(zhat_all[:len(zhat_cusum_all)] == zhat_cusum_all)) if len(zhat_cusum_all)==len(zhat_all) else np.nan
-        Lbar = summary.get("avg_inferred_regime_length", np.nan)
-        mode_usage = summary.get("mode_usage", None)
-        if isinstance(mode_usage, dict):
-            p_dom = float(max(mode_usage.values()))
-        elif hasattr(mode_usage, "__iter__"):
-            p_dom = float(np.max(mode_usage))
-        else:
-            p_dom = np.nan
-        dELBO = summary.get("elbo_delta (last run)", np.nan)
-        c_rel = summary.get("cagr_rel", np.nan)
-        c_rel_ex = summary.get("cagr_rel_ex_ante", np.nan)
-        
-        # --- Rule
-        nice = (
-            (Lbar >= 20) and
-            (agree_cusum >= 0.70 if not np.isnan(agree_cusum) else True) and
-            (ncpll >= 0.60) and
-            (dELBO >= 0) and
-            (c_rel >= 0) and
-            (np.isnan(c_rel_ex) or c_rel_ex >= 0)
-        )
-        difficult = (
-            (Lbar <= 5) or
-            (agree_cusum <= 0.55 if not np.isnan(agree_cusum) else False) or
-            (ncpll <= 0.40) or
-            (p_dom >= 0.90) or
-            ((c_rel < 0) and (not np.isnan(c_rel_ex) and c_rel_ex < 0))
-        )
-        tag = "nice" if nice else ("difficult" if difficult else "borderline")
-        
-        summary.update({
-            "ncpll": ncpll,
-            "agree_cusum": agree_cusum,
-            "p_dom": p_dom,
-            "niceness_tag": tag
-        })
-        
-        '''
     
         leaderboard_local.append(dict(score=summary["cagr_rel"], params=(r, b), summary=summary))
     
@@ -423,38 +375,25 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                 "score": entry["score"],
                 **r_clean, **b,
                 "avg_inferred_regime_length": s.get("avg_inferred_regime_length"),
+                "mode_usage": s.get("mode_usage"),
                 "elbo_start (last run)": s.get("elbo_start (last run)"),
                 "elbo_end (last run)": s.get("elbo_end (last run)"),
                 "elbo_delta (last run)": s.get("elbo_delta (last run)"),
-                "mode_usage": s.get("mode_usage"),
+                "cpll (max all runs)": s.get("cpll (max all runs)"),
+                "max cpll (proxy bound, paired)": s.get("max cpll (proxy bound, paired)"),
                 "cagr_rel": s.get("cagr_rel"),
                 "cagr_strat": s.get("cagr_strat"),
-                "cagr_bench": s.get("cagr_bench"),
-            }
-            
+                "cagr_bench": s.get("cagr_bench"),}
             if "cagr_rel_cusum" in s:
                 row.update({
                     "cagr_rel_cusum": s["cagr_rel_cusum"],
                     "cagr_strat_cusum": s["cagr_strat_cusum"],
-                    "cagr_bench_cusum": s["cagr_bench_cusum"],
-                })
-                
+                    "cagr_bench_cusum": s["cagr_bench_cusum"],})
             if "cagr_rel_ex_ante" in s:
                 row.update({
                     "cagr_rel_ex_ante": s["cagr_rel_ex_ante"],
                     "cagr_strat_ex_ante": s["cagr_strat_ex_ante"],
-                    "cagr_bench_ex_ante": s["cagr_bench_ex_ante"],
-                })
-
-            '''
-            row.update({
-                "ncpll": s.get("ncpll"),
-                "agree_cusum": s.get("agree_cusum"),
-                "p_dom": s.get("p_dom"),
-                "niceness_tag": s.get("niceness_tag"),
-            })
-            '''
-        
+                    "cagr_bench_ex_ante": s["cagr_bench_ex_ante"],})
             rows.append(row)
         
         df = pd.DataFrame(rows)
@@ -717,17 +656,17 @@ def pipeline_actual(securities, CONFIG):
     
     # === IO manager (temp CSV during runs; flush per security) ===
     results_header_cols = [
-        "security", "config", "rank", "score", "dt",
-        "n_regimes", "dim_latent", "single_subspace",
-        "train_window", "overlap_window", "avg_inferred_regime_length",
-        "elbo_start (last run)", "elbo_end (last run)", "elbo_delta (last run)",
-        "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",
-        "cagr_rel_cusum", "cagr_strat_cusum", "cagr_bench_cusum",
-        "cagr_rel_ex_ante", "cagr_strat_ex_ante", "cagr_bench_ex_ante",
-    ]
-
+        "security","config","rank","score","dt",
+        "n_regimes","dim_latent","single_subspace",
+        "train_window","overlap_window","avg_inferred_regime_length",
+        "elbo_start (last run)","elbo_end (last run)","elbo_delta (last run)",
+        "cpll (max all runs)","max cpll (proxy bound, paired)",
+        "mode_usage","cagr_rel","cagr_strat","cagr_bench",
+        "cagr_rel_cusum","cagr_strat_cusum","cagr_bench_cusum",
+        "cagr_rel_ex_ante","cagr_strat_ex_ante","cagr_bench_ex_ante",]
+    CONFIG["results_header_cols"] = results_header_cols
+    
     # making sure CONFIG carries everything IOManager expects
-    CONFIG.setdefault("results_header_cols", results_header_cols)
     CONFIG.setdefault("segments_header_cols", ("security","config","date","t","z"))
     CONFIG.setdefault("tmp_results_fmt",  "{tmp_dir}/results_tmp_{security}.csv")
     CONFIG.setdefault("tmp_segments_fmt", "{tmp_dir}/segments_tmp_{security}.csv")
@@ -748,15 +687,8 @@ def pipeline_actual(securities, CONFIG):
     
     # output CSV
     gridsearch_csv = results_csv_path
-    columns = [
-        "security", "config", "rank", "score", "dt",
-        "n_regimes", "dim_latent", "single_subspace",
-        "train_window", "overlap_window", "avg_inferred_regime_length",
-        "elbo_start (last run)", "elbo_end (last run)", "elbo_delta (last run)",
-        "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",]
-        # "ncpll", "agree_cusum", "p_dom", "niceness_tag"]
-        
-    # initialize results file only if missing/empty, using IO header to avoid drift
+
+    # initialize results file only if missing/empty
     if (not os.path.exists(gridsearch_csv)) or (os.path.getsize(gridsearch_csv) == 0):
         pd.DataFrame(columns=CONFIG["results_header_cols"]).to_csv(gridsearch_csv, index=False)
 
@@ -768,7 +700,6 @@ def pipeline_actual(securities, CONFIG):
     def _append(security, cfg, df_res):
         if df_res is None or len(df_res) == 0:
             return
-    
         out = df_res.copy()
         if out.dropna(axis=1, how="all").empty:
             return
@@ -779,9 +710,15 @@ def pipeline_actual(securities, CONFIG):
         dt_val = CONFIG["dt"]
         dt_str = f"1/{int(round(1.0/dt_val))}" if dt_val > 0 else str(dt_val)
         out.insert(4, "dt", dt_str)
-
-        # buffer to temp CSV (fast); master append happens at per-security flush
+    
+        # force schema/order
+        header = CONFIG["results_header_cols"]
+        for c in header:
+            if c not in out.columns:
+                out[c] = pd.NA
+        out = out[header]
         io_mgr.append_temp_results(security, out)
+
 
     def _append_segments_tmp(security, config_label, details, io_mgr):
         """
