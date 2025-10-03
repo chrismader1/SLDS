@@ -360,7 +360,10 @@ def evaluate_portfolio(fit, data, G):
         stats_oos["gap"] = float(stats_oos["sigma_ann"] - risk_tr)
         stats_oos["kappa"] = float(fit.get("kappa", np.nan))
         stats_oos["delta"] = float(fit.get("delta", np.nan))
+        rebal = [0, n_days]
+        stats_oos["avg_holding_per"] = _avg_holding_period_from_marks(rebal)
         return stats_oos
+    
     else:  # piecewise
         cfg = {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "risk_budget": G["risk_budget"], "annualization_factor": AF}
         stats_oos = portfolio_stats_multipiece(fit["w_list"], fit["segs"], test, cfg)
@@ -381,7 +384,11 @@ def evaluate_portfolio(fit, data, G):
         stats_oos["delta"] = np.nan                 # leave single 'delta' empty for Regime-DRO
         for j, dj in enumerate(dlist, start=1):     # expose delta_k1, delta_k2, ...
             stats_oos[f"delta_k{j}"] = dj
-    
+        rebal = list(fit.get("segs", []))
+        if not rebal:
+            # fallback if segs missing: treat as static
+            rebal = [0, n_days]
+        stats_oos["avg_holding_per"] = _avg_holding_period_from_marks(rebal)
         return stats_oos
 
 def evaluate_regime_independently(fit, data, G):
@@ -442,17 +449,32 @@ def stats_from_series(port_daily, config):
     sharpe_annual = (np.mean(port_daily) - rf_daily) / sigma_daily * np.sqrt(AF) if sigma_daily > 0 else np.nan
     return mu_annual_geom, sigma_annual, sharpe_annual
 
+def _max_drawdown_from_series(port_daily):
+    """
+    Max drawdown of a daily-return series.
+    Returns the minimum (most negative) drawdown, e.g. -0.27 for -27%.
+    """
+    x = np.asarray(port_daily, float)
+    if x.size == 0:
+        return float("nan")
+    equity = np.cumprod(1.0 + x)
+    peak = np.maximum.accumulate(equity)
+    dd = equity / peak - 1.0
+    return float(np.min(dd))
+
 def portfolio_stats(weights, returns, config):
     """Static weights over full horizon."""
     weights = np.asarray(weights).reshape(-1)
     port_daily = returns @ weights
     mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
+    max_dd = _max_drawdown_from_series(port_daily)
     return {
         "mu_ann": mu_annual_geom,
         "sigma_ann": sigma_annual,
         "sharpe_ann": sharpe_annual,
-        "vol_breach": vol_breach}
+        "vol_breach": vol_breach,
+        "max_drawdown": max_dd,}
 
 def portfolio_stats_multipiece(w_list, taus, returns, config):
     """
@@ -467,8 +489,13 @@ def portfolio_stats_multipiece(w_list, taus, returns, config):
         port_daily[a:b] = returns[a:b] @ np.asarray(w_list[k]).reshape(-1)
     mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
-    return {"mu_ann": mu_annual_geom, "sigma_ann": sigma_annual, "sharpe_ann": sharpe_annual, "vol_breach": vol_breach}
-
+    max_dd = _max_drawdown_from_series(port_daily)
+    return {
+        "mu_ann": mu_annual_geom,
+        "sigma_ann": sigma_annual,
+        "sharpe_ann": sharpe_annual,
+        "vol_breach": vol_breach,
+        "max_drawdown": max_dd,}
 
 # ---------------------------------------------------------------
 # Statistical tests (for hypothesis testing)
@@ -657,7 +684,7 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
     Cols: in the order provided by `model_order` (or insertion order of `results`).
     """
     base_rows = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","p_viol",
-                 "gross_exp","kappa","gap","delta"]
+                 "gross_exp","kappa","gap","delta","max_drawdown"]
     if model_order is None:
         model_order = list(results.keys())
 
@@ -673,8 +700,6 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
         except: return 10**9
     delta_k_cols = sorted(set(delta_k_cols), key=_seg_ix)
     rows = base_rows + delta_k_cols
-    # <<<
-
     table = {}
     for m in model_order:
         if m not in results: continue
@@ -686,11 +711,9 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
         if "vol_breach" in df.columns:
             z = (df["vol_breach"] > 0).astype(float)
             s["p_viol"] = _fmt_series(z)
-        # >>> add the per-segment delta summaries if present
         for c in delta_k_cols:
             if c in df.columns and len(df[c].dropna())>0:
                 s[c] = _fmt_series(df[c])
-        # <<<
         table[m] = pd.Series(s)
     return pd.DataFrame(table).reindex(rows)
 
@@ -846,6 +869,25 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
         print("Top 3 assets with smallest nonzero weights:")
         for i in bot_idx:
             print(f"Asset {i:2d}: weight = {w[i]:+.4f}, μ = {mu_seg_ann[i]:+.4f}, σ = {sig_seg_ann[i]:.4f}")
+
+def _avg_holding_period_from_marks(rebal_marks):
+    """
+    Avg holding period = max(rebal)/(len(rebal)-1)
+    where `rebal` is a list/array of rebalance indices (e.g., [0, ..., T]).
+    """
+    if rebal_marks is None:
+        return float("nan")
+    r = [int(x) for x in rebal_marks]
+    if len(r) <= 1:
+        return float("nan")
+    return float(max(r) / (len(r) - 1))
+
+def _fmt4(a):
+    import numpy as _np
+    return _np.array2string(
+        _np.asarray(a, float),
+        separator=' ',
+        formatter={'float_kind': lambda x: f"{x:.4f}"})
 
 # -------------------------
 # Pipeline helpers
@@ -1070,38 +1112,9 @@ def _labels_from_segments_df(segments_df, security, config):
 # Pipeline
 # -------------------------
 
-def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
+def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True):
     
     import numpy as np, pandas as pd, hashlib, os
-
-    # ---------- helpers (debug only) ----------
-    def _sha(arr: np.ndarray) -> str:
-        a = np.ascontiguousarray(np.asarray(arr, float))
-        return hashlib.sha256(a.tobytes()).hexdigest()[:16]
-
-    def _dbg_dataset(tag: str, data: dict):
-        tr = data["train"]; te = data["test"]
-        print(f"[DEBUG:{tag}] train.shape={tr.shape}  test.shape={te.shape}")
-        # column names may be kept in px_cols
-        cols_tr = data.get("px_cols", None)
-        if cols_tr is None and isinstance(tr, pd.DataFrame):
-            cols_tr = list(tr.columns)
-        cols_te = cols_tr
-        print(f"[DEBUG:{tag}] columns(train)==columns(test)? {True}")
-        print(f"[DEBUG:{tag}] columns={cols_tr}")
-        if isinstance(tr, pd.DataFrame):
-            na_tr = tr.isna().sum().to_dict()
-            na_te = te.isna().sum().to_dict() if isinstance(te, pd.DataFrame) else {}
-            print(f"[DEBUG:{tag}] NaNs(train) per col={na_tr}")
-            print(f"[DEBUG:{tag}] NaNs(test)  per col={na_te}")
-            print(f"[DEBUG:{tag}] train index: {tr.index.min()} → {tr.index.max()} (len={len(tr.index)})")
-            print(f"[DEBUG:{tag}] test  index:  {te.index.min()} → {te.index.max()} (len={len(te.index)})")
-            print(f"[DEBUG:{tag}] dtypes(train)={[str(t) for t in tr.dtypes]}")
-            print(f"[DEBUG:{tag}] dtypes(test) ={[str(t) for t in te.dtypes]}")
-        # numeric fingerprints
-        tr_np = tr.to_numpy(dtype=float) if isinstance(tr, pd.DataFrame) else np.asarray(tr, float)
-        te_np = te.to_numpy(dtype=float) if isinstance(te, pd.DataFrame) else np.asarray(te, float)
-        print(f"[DEBUG:{tag}] sha(train)={_sha(tr_np)}  sha(test)={_sha(te_np)}")
 
     def _resolve_rSLDS_outputs(RSLDS_CONFIG):
         res_csv  = RSLDS_CONFIG["results_csv"]
@@ -1110,13 +1123,10 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
 
     # when running gridsearch, ignore provided tickers
     if DRO_CONFIG.get("run_gridsearch", False):
-        res_csv, _ = _resolve_rSLDS_outputs(RSLDS_CONFIG)
-        if not os.path.exists(res_csv):
-            raise FileNotFoundError(f"run_gridsearch=True but results CSV not found: {res_csv}")
-        df_res = pd.read_csv(res_csv, usecols=range(10), dtype={0: str, 1: str})
-        tickers = sorted(df_res["security"].astype(str).unique())
-        print(f"[DEBUG:SECS] run_gridsearch=True → overriding tickers from results_csv: {tickers}")
-
+        print(f"run_gridsearch=True → using tickers passed in: {tickers}\n")
+    else:
+        print(f"run_gridsearch=False → using tickers in gridsearch_results\n")
+    
     # 0) Panels
     px_all, eps_all, pe_all, ser_vix = import_data(RSLDS_CONFIG["data_excel"])
     # ensure every ticker exists in px_all; warn+drop otherwise
@@ -1147,22 +1157,17 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
     R_use_clean = R_use.dropna(how="any")
     dataA = make_data_from_returns_panel(R_use_clean)
 
-    # Debug digest for the returns dataset (same in both modes)
-    print(f"[DEBUG:MODE] run_gridsearch={bool(DRO_CONFIG.get('run_gridsearch', False))}")
-    print(f"[DEBUG:R] R_use.shape={R_use.shape}  R_use_clean.shape={R_use_clean.shape}")
-    print(f"[DEBUG:R] cols={list(R_use.columns)}")
-    print(f"[DEBUG:R] index span: {R_use.index.min()} → {R_use.index.max()}  (len={len(R_use.index)})")
-    _dbg_dataset("DATA_A", {"train": R_use_clean, "test": R_use_clean, "px_cols": list(R_use_clean.columns)})
-
     # 3) Part A: static DRO (on common intersection)
     N = dataA["train"].shape[1]
-    print(f"[DEBUG:FIT_A] N={N} (assets in DATA_A)")
     paramsA = dict(DELTA_DEFAULTS[DRO_CONFIG["delta_name"]])
     fitA = fit_dro(dataA, paramsA, DRO_CONFIG["GLOBAL"])
-    print(f"[DEBUG:FIT_A] len(w)={len(fitA['w'])}")
     assert len(fitA["w"]) == N, f"len(w)={len(fitA['w'])} != N={N} from DATA_A"
     summA = evaluate_portfolio({"type": "static", "w": fitA["w"]}, dataA, DRO_CONFIG["GLOBAL"])
-
+    # Part A daily portfolio returns (on intersection calendar)
+    partA_daily = pd.Series(
+        dataA["train"] @ np.asarray(fitA["w"]).reshape(-1),
+        index=dataA["index"], name="PartA_daily")
+    
     # 4) rSLDS labels (CSV affects model selection; Parquet supplies segments)
     Z_labels = {}
     
@@ -1223,24 +1228,15 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
     avail = [sec for sec in tickers if sec in Z_labels]
     if not avail:
         raise RuntimeError("No assets produced rSLDS labels. Cannot proceed with Part B.")
-
-    def _sha1(x):  # short fingerprint for equality checks across modes
-        a = np.asarray(x, float)
-        return hashlib.sha1(a.tobytes()).hexdigest()[:12]
     
     T = len(R_df_all.index)
-    print(f"[DEBUG:Z] T={T} (union calendar length)  tickers={list(avail)}")
     
     for sec in avail:
         z = np.asarray(Z_labels[sec], float)
         assert z.shape[0] == T, f"[{sec}] label length {len(z)} != T={T}"
         n_nan = int(np.isnan(z).sum())
         uniq  = sorted(set([int(u) for u in np.unique(z[np.isfinite(z)])])) if np.isfinite(z).any() else []
-        print(f"[DEBUG:Z] {sec}: len={len(z)}  NaN={n_nan}  unique_states={uniq}  sha={_sha1(z)}")
-    
-    # stable ordering used downstream
-    print(f"[DEBUG:NAMES] order={list(avail)}")
-
+        
     # 5) Per-asset segments + entry indices
     per_asset_segs_on_cal = {}
     for sec in avail:
@@ -1330,24 +1326,37 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS):
         "mu_ann_full": np.zeros(len(names_all)),
         "Sigma_ann_full": np.eye(len(names_all)),
         "px_cols": names_all,
-        "index": R_df_all.index
-    }
+        "index": R_df_all.index}
+    
     # extra dataset digest for Part B eval
-    print(f"[DEBUG:DATA_B] eval.shape={data_eval['train'].shape}  cols={names_all}")
-    print(f"[DEBUG:DATA_B] sha(eval)={_sha(data_eval['train'])}")
-
     X = R_df_all.fillna(0.0).to_numpy(dtype=float)
-    print(f"[DEBUG:EVAL] eval.shape={X.shape}  cols={list(names_all)}")
-    print(f"[DEBUG:EVAL] eval.sha={hashlib.sha1(X.tobytes()).hexdigest()[:12]}")
-
     summB = evaluate_portfolio(fitB, data_eval, DRO_CONFIG["GLOBAL"])
 
-    print("\n[Part A] Static DRO summary:\n", pd.Series(summA).round(4))
-    print("\n[Part B] Regime-DRO summary:\n", pd.Series(summB).round(4))
+    # Part B daily portfolio returns (on union calendar)
+    X_union = R_df_all.fillna(0.0).to_numpy(dtype=float)   # same as evaluation
+    T = X_union.shape[0]
+    partB = np.zeros(T, dtype=float)
+    for (a, b), w_k in zip(zip(fitB["segs"][:-1], fitB["segs"][1:]), fitB["w_list"]):
+        partB[a:b] = X_union[a:b] @ np.asarray(w_k).reshape(-1)
     
+    partB_daily = pd.Series(partB, index=R_df_all.index, name="PartB_daily")
+    
+    if verbose:
+        print("\n[Part A] Static DRO summary:\n", pd.Series(summA).round(4))
+        print("\n[Part B] Regime-DRO summary:\n", pd.Series(summB).round(4))
+    
+        # portfolios (weights)
+        print("\n[Part A] weights:\n", _fmt4(fitA["w"]), flush=True)
+        print("\n[Part B] piecewise weights:", flush=True)
+        for k, w_k in enumerate(fitB["w_list"], 1):
+            print(f"  k={k}: {_fmt4(w_k)}", flush=True)
+
     return {
         "PartA": {"fit": fitA, "data": dataA, "summary": summA},
         "PartB": {"fit": fitB, "summary": summB,
                   "per_asset_segs": per_asset_segs_on_cal, "global_segs": taus,
                   "Z_labels": Z_labels},
+        "returns_union": R_df_all,                  # <-- (optional) full panel for your plotting/diagnostics
+        "series": {"PartA_daily": partA_daily, "PartB_daily": partB_daily},
         "tickers": avail}
+
