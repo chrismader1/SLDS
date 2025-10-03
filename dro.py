@@ -381,23 +381,6 @@ def evaluate_portfolio(fit, data, G):
         stats_oos["delta"] = np.nan                 # leave single 'delta' empty for Regime-DRO
         for j, dj in enumerate(dlist, start=1):     # expose delta_k1, delta_k2, ...
             stats_oos[f"delta_k{j}"] = dj
-
-        seg_excess = []
-        for (a, b), wk in zip(zip(fit["segs"][:-1], fit["segs"][1:]), fit["w_list"]):
-            seg_length = b - a
-            if seg_length <= 1:
-                seg_excess.append(0.0)
-                continue
-            # Isolate the segment's return series
-            seg_series = test[a:b] @ wk
-            # Create a config for this segment, providing the correct annualization factor
-            seg_config = dict(G)
-            seg_config["annualization_factor"] = AF
-            seg_config["n_days"] = n_days
-            # Calculate stats using the correct factor
-            _, sigma_seg_ann, _ = stats_from_series(seg_series, seg_config)
-            seg_excess.append(max(sigma_seg_ann - G["risk_budget"], 0.0))
-        stats_oos["seg_excess"] = seg_excess
     
         return stats_oos
 
