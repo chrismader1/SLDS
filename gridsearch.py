@@ -755,8 +755,10 @@ def pipeline_actual(securities, CONFIG):
         "elbo_start (last run)", "elbo_end (last run)", "elbo_delta (last run)",
         "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",]
         # "ncpll", "agree_cusum", "p_dom", "niceness_tag"]
-    
-    pd.DataFrame(columns=columns).to_csv(gridsearch_csv, index=False)
+        
+    # initialize results file only if missing/empty, using IO header to avoid drift
+    if (not os.path.exists(gridsearch_csv)) or (os.path.getsize(gridsearch_csv) == 0):
+        pd.DataFrame(columns=CONFIG["results_header_cols"]).to_csv(gridsearch_csv, index=False)
 
     # import data
     px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])

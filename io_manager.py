@@ -47,7 +47,8 @@ class IOManager:
 
     # ---------- master init ----------
     def _ensure_master_results_csv(self):
-        if not os.path.exists(self.results_csv):
+        need_init = (not os.path.exists(self.results_csv)) or (os.path.getsize(self.results_csv) == 0)
+        if need_init:
             pd.DataFrame(columns=self.results_header_cols).to_csv(self.results_csv, index=False)
 
     # ---------- temp appends (fast) ----------
@@ -55,16 +56,16 @@ class IOManager:
         if df is None or df.empty: return
         df = df.reindex(columns=self.results_header_cols)
         tmp = self._tmp_results(security)
-        write_header = not os.path.exists(tmp)
+        write_header = (not os.path.exists(tmp)) or (os.path.getsize(tmp) == 0)
         df.to_csv(tmp, mode="a", header=write_header, index=False)
 
     def append_temp_segments(self, security, df):
         if df is None or df.empty: return
         df = df.reindex(columns=self.segments_header_cols)
         tmp = self._tmp_segments(security)
-        write_header = not os.path.exists(tmp)
+        write_header = (not os.path.exists(tmp)) or (os.path.getsize(tmp) == 0)
         df.to_csv(tmp, mode="a", header=write_header, index=False)
-
+    
     # ---------- helpers ----------
     @staticmethod
     def _coerce_segments_schema(df):
@@ -83,15 +84,29 @@ class IOManager:
 
     # ---------- flush to master ----------
     def _append_csv_file_to_master(self, tmp_csv, master_csv):
-        if not os.path.exists(tmp_csv): return
+        if not os.path.exists(tmp_csv):
+            return
+    
+        # Make sure master has a header row if empty/missing
         self._ensure_master_results_csv()
+    
         with open(tmp_csv, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        if len(lines) <= 1:
+        if not lines:
             return
+    
+        expected = ",".join(self.results_header_cols) + "\n"
+        first_is_header = (lines[0].strip() == expected.strip())
+    
+        # If temp has a header, drop it; otherwise keep all lines
+        payload = lines[1:] if first_is_header else lines
+    
+        if not payload:
+            return
+    
         with open(master_csv, "a", encoding="utf-8") as out:
-            out.writelines(lines[1:])
-
+            out.writelines(payload)
+            
     def _append_to_parquet(self, tmp_csv, parquet_path):
         if not os.path.exists(tmp_csv): return
         new_df = pd.read_csv(tmp_csv)
