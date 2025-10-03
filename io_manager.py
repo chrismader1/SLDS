@@ -1,6 +1,7 @@
 import os, pandas as pd, shutil, io
 from filelock import FileLock
 import tempfile
+import csv
 
 class IOManager:
     """
@@ -47,23 +48,29 @@ class IOManager:
     def _ensure_master_results_csv(self):
         need_init = (not os.path.exists(self.results_csv)) or (os.path.getsize(self.results_csv) == 0)
         if need_init:
-            pd.DataFrame(columns=self.results_header_cols).to_csv(self.results_csv, index=False)
-
+            pd.DataFrame(columns=self.results_header_cols).to_csv(
+                self.results_csv, index=False,
+                quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
+    
     # ---------- temp appends (fast) ----------
     def append_temp_results(self, security, df):
         if df is None or df.empty: return
         df = df.reindex(columns=self.results_header_cols)
         tmp = self._tmp_results(security)
         write_header = (not os.path.exists(tmp)) or (os.path.getsize(tmp) == 0)
-        df.to_csv(tmp, mode="a", header=write_header, index=False)
-
+        df.to_csv(
+            tmp, mode="a", header=write_header, index=False,
+            quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
+    
     def append_temp_segments(self, security, df):
         if df is None or df.empty: return
         df = df.reindex(columns=self.segments_header_cols)
         tmp = self._tmp_segments(security)
         write_header = (not os.path.exists(tmp)) or (os.path.getsize(tmp) == 0)
-        df.to_csv(tmp, mode="a", header=write_header, index=False)
-    
+        df.to_csv(
+            tmp, mode="a", header=write_header, index=False,
+            quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
+
     # ---------- helpers ----------
     @staticmethod
     def _coerce_segments_schema(df):
@@ -103,9 +110,11 @@ class IOManager:
             d = os.path.dirname(master_csv) or "."
             with tempfile.NamedTemporaryFile("w", delete=False, dir=d, suffix=".csv") as tf:
                 tmp_out = tf.name
-            out.to_csv(tmp_out, index=False)
+            out.to_csv(
+                tmp_out, index=False,
+                quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
             os.replace(tmp_out, master_csv)
-    
+
     def _append_to_parquet(self, tmp_csv, parquet_path):
         if not (os.path.exists(tmp_csv) and os.path.getsize(tmp_csv) > 0):
             return
@@ -132,7 +141,7 @@ class IOManager:
             pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp_out)
             os.replace(tmp_out, parquet_path)
 
-   def flush_one_security(self, security):
+    def flush_one_security(self, security):
         # Always remove tmp files—even if there’s nothing to append
         tmp_res = self._tmp_results(security)
         tmp_seg = self._tmp_segments(security)
@@ -141,19 +150,22 @@ class IOManager:
         if os.path.exists(tmp_res) and os.path.getsize(tmp_res) > 0:
             df = pd.read_csv(tmp_res).reindex(columns=self.results_header_cols)
             if df.shape[0] > 0:
-                df.to_csv(tmp_res, index=False)
+                df.to_csv(
+                    tmp_res, index=False,
+                    quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
                 self._append_csv_file_to_master(tmp_res, self.results_csv)
-            os.remove(tmp_res)  # remove regardless
-    
+            os.remove(tmp_res)
+        
         # SEGMENTS
         if os.path.exists(tmp_seg) and os.path.getsize(tmp_seg) > 0:
             df = pd.read_csv(tmp_seg)
             df = self._coerce_segments_schema(df)
             if df.shape[0] > 0:
-                # re-save normalized, then append
-                df.to_csv(tmp_seg, index=False)
+                df.to_csv(
+                    tmp_seg, index=False,
+                    quoting=csv.QUOTE_MINIMAL, escapechar="\\", doublequote=True, lineterminator="\n")
                 self._append_to_parquet(tmp_seg, self.segments_parquet)
-            os.remove(tmp_seg)  # remove regardless
+            os.remove(tmp_seg)
 
     # ---------- reader ----------
     def read_segments_for_stock(self, security, parquet_path=None):

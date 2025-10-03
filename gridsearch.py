@@ -305,7 +305,10 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
     
         # ---- Plot overlay when lengths match (kept; not passed to evaluator)
         overlays = {"CUSUM": zhat_cusum_all} if len(zhat_cusum_all) == len(zhat_all) else None
-        
+
+        # Clean ELBO traces to ignore NaNs/±inf and empty runs
+        elbo_all = _clean_elbo_runs(elbo_all)
+
         # ---- Evaluation (now pass cpll & max_cpll)
         summary = evaluate_rSLDS_actual(
             y_valid, px_valid, zhat_cusum_all, xhat_all, elbo_all, model, 
@@ -410,6 +413,38 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
+
+def _safe_cell(v):
+    import numpy as _np, json as _json
+    if isinstance(v, dict):
+        # compact JSON (no spaces). Still contains commas, so prefer string without commas.
+        # If you want to keep JSON, it will be quoted by pandas; otherwise use ';' join.
+        return _json.dumps(v, separators=(",", ":"))
+    if isinstance(v, (list, tuple, _np.ndarray)):
+        # render WITHOUT commas to avoid confusing CSV parser
+        arr = _np.asarray(v)
+        return _np.array2string(arr, separator=" ", max_line_width=10**9)
+    return v
+
+def _clean_elbo_runs(elbo_runs):
+    """
+    Take a list of 1D arrays/lists (one per batch/run).
+    Drop empty runs and non-finite points. If a run becomes empty, drop it.
+    Returns a list of 1D float np.arrays.
+    """
+    import numpy as _np
+    cleaned = []
+    if elbo_runs is None:
+        return cleaned
+    for run in elbo_runs:
+        a = _np.asarray(run, dtype=float).ravel()
+        if a.size == 0:
+            continue
+        a = a[_np.isfinite(a)]
+        if a.size == 0:
+            continue
+        cleaned.append(a)
+    return cleaned
 
 def _intersect_indexes(series_list):
     idx = series_list[0].index
@@ -719,8 +754,13 @@ def pipeline_actual(securities, CONFIG):
             if c not in out.columns:
                 out[c] = pd.NA
         out = out[header]
+        
+        # make object-y columns CSV-safe (no raw commas)
+        for col in ["mode_usage"]:
+            if col in out.columns:
+                out[col] = out[col].apply(_safe_cell)
+        
         io_mgr.append_temp_results(security, out)
-
 
     def _append_segments_tmp(security, config_label, details, io_mgr):
         """
