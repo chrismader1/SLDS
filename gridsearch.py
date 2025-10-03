@@ -300,17 +300,7 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         mask_valid = np.ones_like(y_valid, dtype=bool)      # (T,N)
         gamma_valid, *_ = model.expected_states(xhat_all, y_valid, mask=mask_valid)
         cpll = compute_smoothed_cpll(model, xhat_all, y_valid, gamma_valid)
-        if y_valid.shape[1] == 1:
-            v = float(np.var(y_valid[:, 0], ddof=1))
-            v = max(v, 1e-12)
-            entropy = 0.5 * np.log(2*np.pi*np.e*v)
-        else:
-            Sigma = np.cov(y_valid.T, ddof=1)
-            sign, logdet = np.linalg.slogdet(Sigma)
-            logdet = logdet if sign > 0 else np.log(1e-12)
-            N = y_valid.shape[1]
-            entropy = 0.5 * (N*np.log(2*np.pi*np.e) + logdet)        
-        max_cpll = -y_valid.shape[0] * entropy
+        max_cpll = max_cpll_upper_bound(y_valid, reg_scale=1e-8)
         cpll_all.append(float(cpll))
         max_cpll_all.append(float(max_cpll))
     
@@ -338,7 +328,9 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                 summary["cagr_rel_ex_ante"] = c_rel_pred
                 summary["cagr_strat_ex_ante"] = c_str_pred
                 summary["cagr_bench_ex_ante"] = c_bench_pred
-    
+
+        '''
+        
         # --- Niceness features
         ncpll = float(cpll / max(max_cpll, 1e-12))
         ncpll = float(
@@ -382,6 +374,8 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
             "p_dom": p_dom,
             "niceness_tag": tag
         })
+        
+        '''
     
         leaderboard_local.append(dict(score=summary["cagr_rel"], params=(r, b), summary=summary))
     
@@ -452,13 +446,15 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                     "cagr_strat_ex_ante": s["cagr_strat_ex_ante"],
                     "cagr_bench_ex_ante": s["cagr_bench_ex_ante"],
                 })
-    
+
+            '''
             row.update({
                 "ncpll": s.get("ncpll"),
                 "agree_cusum": s.get("agree_cusum"),
                 "p_dom": s.get("p_dom"),
                 "niceness_tag": s.get("niceness_tag"),
             })
+            '''
         
             rows.append(row)
         
@@ -734,8 +730,8 @@ def pipeline_actual(securities, CONFIG, filename, out_path):
         "n_regimes", "dim_latent", "single_subspace",
         "train_window", "overlap_window", "avg_inferred_regime_length",
         "elbo_start (last run)", "elbo_end (last run)", "elbo_delta (last run)",
-        "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",
-        "ncpll", "agree_cusum", "p_dom", "niceness_tag"]
+        "mode_usage", "cagr_rel", "cagr_strat", "cagr_bench",]
+        # "ncpll", "agree_cusum", "p_dom", "niceness_tag"]
     
     pd.DataFrame(columns=columns).to_csv(gridsearch_csv, index=False)
 
@@ -1044,6 +1040,8 @@ def seed_stability_from_config(cfg, securities, filename):
 
     # --------- 4) fit across seeds ----------
     mdls, Z_pre_list, X_pre_list = [], [], []
+    cpll_runs = []
+    max_cpll_runs = []
     for s in seeds:
         if restricted:
             _, _, _, _, mdl = fit_rSLDS_restricted(

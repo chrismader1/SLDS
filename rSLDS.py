@@ -604,8 +604,7 @@ def inference_rSLDS(px, mdl, y_test, q_train=None, z_true=None, y_train=None, dt
 
     # CPLL
     cpll = compute_smoothed_cpll(mdl, xhat_test, y_test, gamma_test)
-    entropy = 0.5 * np.log(2 * np.pi * np.e * np.var(y_test))
-    max_cpll = -len(y_test) * entropy
+    max_cpll = max_cpll_upper_bound(y_test, reg_scale=1e-8)
 
     return {"xhat": xhat_test, "zhat": zhat_test, "gamma": gamma_test,
             "cpll": cpll, "max_cpll": max_cpll, "mdl": mdl}
@@ -1026,66 +1025,121 @@ def cusum_overlay_zscore(prices, y, xhat, mdl, h_z, verbose=False):
 # Evaluate rSLDS
 # ---------------------------------------------------------------
 
-def compute_smoothed_cpll(mdl, x_smooth, y, gamma_smooth):
-
+def compute_smoothed_cpll(model, x_smooth, y, gamma_smooth,
+                          var_floor=1e-8, var_cap=1e6, jitter=1e-8):
     """
     Conditional predictive log-likelihood 
     True CPLL uses E[x_{t-1} | y_{1:t-1}] for one-step (online) forecasts.
     Smoothed CPLL uses E[x_t | y_{1:T}] and hence overestimates predictive power.
     Max CPLL: approx. practical upper bound on CPLL (Gaussian entropy limit)
     See: https://en.wikipedia.org/wiki/Differential_entropy
+    Computations:
+    CPLL = sum_{t=1}^{T-1} log N(y_t ; μ̄_t, Σ_t)
+    where:
+      μ_k(t) = C_k x_{t-1} + d_k
+      μ̄_t   = Σ_k γ_{t-1,k} μ_k(t)
+      R_k    = diag(exp(-inv_eta_k))
+      Σ_t    = Σ_k γ_{t-1,k} [ R_k + (μ_k(t) - μ̄_t)(μ_k(t) - μ̄_t)^T ]
     """
-    
-    T, N = y.shape
-    K = gamma_smooth.shape[1]
-    logL = 0.0
-    shared = mdl.emissions.Cs.shape[0] == 1
+    # to arrays + basic checks
+    x_smooth   = np.asarray(x_smooth, dtype=float)
+    y          = np.asarray(y, dtype=float)
+    gamma_smooth = np.asarray(gamma_smooth, dtype=float)
 
-    eps = 1e-6  # Regularization for numerical stability
-    var_floor = 1e-6  # Prevent zero variance
+    if y.ndim == 1: y = y[:, None]
+    T, N = y.shape
+    if T < 2:
+        return 0.0
+
+    # emissions (support shared or per-k)
+    Cs  = np.asarray(model.emissions.Cs)
+    ds  = np.asarray(model.emissions.ds)
+    inv = np.asarray(model.emissions.inv_etas)
+
+    shared = (Cs.shape[0] == 1)
+    K = gamma_smooth.shape[1]
+
+    # quick input sanity
+    if not (np.isfinite(x_smooth).all() and np.isfinite(y).all() and np.isfinite(gamma_smooth).all()):
+        raise ValueError("NaNs/Infs in inputs to compute_smoothed_cpll")
+
+    logL = 0.0
+    I = np.eye(N)
 
     for t in range(1, T):
+        g = gamma_smooth[t-1]
+        s = float(g.sum())
+        if not np.isfinite(s) or s <= 0:
+            raise ValueError(f"Invalid gamma row at t={t-1}")
+        g = g / s  # normalize once
+
         mu_bar = np.zeros(N)
+        mus, Rks = [], []
+
+        xprev = x_smooth[t-1].reshape(-1)
+
+        for k in range(K):
+            Ck = Cs[0] if shared else Cs[k]         # (N,D)
+            dk = ds[0] if shared else ds[k]         # (N,)
+            ik = inv[0] if shared else inv[k]       # (N,)
+
+            # var_k = exp(-inv_eta_k), two-sided clip to avoid {0, inf}
+            var_k = np.exp(-np.asarray(ik, dtype=float))
+            var_k = np.clip(var_k, var_floor, var_cap)
+            Rk = np.diag(var_k)
+
+            mu_k = Ck @ xprev + dk
+            mus.append(mu_k)
+            Rks.append(Rk)
+            mu_bar += g[k] * mu_k
+
+        # mixture covariance
         Sigma = np.zeros((N, N))
-
         for k in range(K):
-            Ck = mdl.emissions.Cs[0] if shared else mdl.emissions.Cs[k]  # (N, D)
-            dk = mdl.emissions.ds[0] if shared else mdl.emissions.ds[k]  # (N,)
-            inv_eta_k = mdl.emissions.inv_etas[0] if shared else mdl.emissions.inv_etas[k]  # (N,)
+            dmu = mus[k] - mu_bar
+            Sigma += g[k] * (Rks[k] + np.outer(dmu, dmu))
 
-            # Variance with clipping
-            var_k = np.clip(1.0 / np.exp(inv_eta_k), var_floor, None)  # (N,)
-            Rk = np.diagflat(var_k)  # (N, N)
+        # relative jitter for PD + numerical stability
+        scale = float(np.trace(Sigma)) / max(N, 1)
+        Sigma = Sigma + (jitter * max(scale, 1e-12)) * I
 
-            mu_k = Ck @ x_smooth[t - 1] + dk  # (N,)
-            mu_bar += gamma_smooth[t - 1, k] * mu_k
-
-        for k in range(K):
-            Ck = mdl.emissions.Cs[0] if shared else mdl.emissions.Cs[k]
-            dk = mdl.emissions.ds[0] if shared else mdl.emissions.ds[k]
-            inv_eta_k = mdl.emissions.inv_etas[0] if shared else mdl.emissions.inv_etas[k]
-            var_k = np.clip(1.0 / np.exp(inv_eta_k), var_floor, None)
-            Rk = np.diagflat(var_k)
-
-            mu_k = Ck @ x_smooth[t - 1] + dk
-            delta_mu = mu_k - mu_bar
-            Sigma += gamma_smooth[t - 1, k] * (Rk + np.outer(delta_mu, delta_mu))
-
-        # Regularize Sigma to ensure it's invertible
-        Sigma_reg = Sigma + eps * np.eye(N)
-
-        # Safety check (optional)
-        if not np.all(np.isfinite(Sigma_reg)):
+        if not np.all(np.isfinite(Sigma)):
             raise ValueError(f"Non-finite Sigma at t={t}")
-        if np.linalg.cond(Sigma_reg) > 1e12:
-            print(f"Warning: ill-conditioned Sigma at t={t}, cond = {np.linalg.cond(Sigma_reg):.2e}")
 
-        mu_bar = mu_bar.flatten()
-        resid = (y[t] - mu_bar).flatten()
-        _, logdet = np.linalg.slogdet(Sigma_reg)
-        logL += -0.5 * (N * np.log(2 * np.pi) + logdet + resid.T @ np.linalg.solve(Sigma_reg, resid))
+        sign, logdet = np.linalg.slogdet(Sigma)
+        if sign <= 0:
+            raise ValueError(f"Non-PD Sigma at t={t}")
 
-    return logL
+        resid = (y[t] - mu_bar).reshape(-1)
+        quad = resid @ np.linalg.solve(Sigma, resid)
+        logL += -0.5 * (N * np.log(2*np.pi) + logdet + quad)
+
+    return float(logL)
+
+
+def max_cpll_upper_bound(y, reg_scale=1e-8):
+    """
+    Upper bound via Gaussian entropy of y:
+      h = 0.5 * [ N*log(2πe) + log det Σ_y ],  Σ_y = cov(y)
+      max_cpll = -(T-1) * h
+    """
+    Y = np.asarray(y, dtype=float)
+    if Y.ndim == 1: Y = Y[:, None]
+    T, N = Y.shape
+    if T < 2:
+        return 0.0
+
+    Sy = np.cov(Y.T, bias=False)  # (N,N)
+    # PD jitter scaled to data energy
+    reg = reg_scale * (np.trace(Sy) / max(N, 1) if np.isfinite(Sy).all() else 1.0)
+    Sy = Sy + reg * np.eye(N)
+
+    sign, logdet = np.linalg.slogdet(Sy)
+    if sign <= 0:
+        raise ValueError("Empirical covariance not PD")
+
+    h = 0.5 * (N * np.log(2*np.pi*np.e) + logdet)
+    return float(-(T - 1) * h)
 
 
 def evaluate_rSLDS_synthetic(prices, y, xhat, zhat, z_true, elbo, mdl, cpll, max_cpll, dt=1/252, label_invariant=True, display=False):
@@ -1348,12 +1402,17 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
         elbo_start = elbo_end = elbo_delta = np.nan
 
     # CPLL across runs (supports scalar or list-of-scalars)
-    cpll_all = np.atleast_1d(cpll).astype(float)
-    max_cpll_all = np.atleast_1d(max_cpll).astype(float)
-    i_star = int(np.nanargmax(cpll_all))
-    cpll_best = float(cpll_all[i_star])
-    max_cpll_paired = float(max_cpll_all[i_star])
-        
+    cpll_all      = np.atleast_1d(cpll).astype(float)
+    max_cpll_all  = np.atleast_1d(max_cpll).astype(float)
+    L = min(len(cpll_all), len(max_cpll_all))          # NEW
+    if L == 0:                                         # NEW
+        cpll_best, max_cpll_paired = np.nan, np.nan    # NEW
+    else:
+        cpll_all, max_cpll_all = cpll_all[:L], max_cpll_all[:L]   # NEW
+        i_star = int(np.nanargmax(cpll_all))
+        cpll_best = float(cpll_all[i_star])
+        max_cpll_paired = float(max_cpll_all[i_star])
+ 
     # Performance
     cagr_rel, cagr_strat, cagr_bench, strategy_index, bench_index, hyp_result = compute_score(px, zhat, dt)
 
