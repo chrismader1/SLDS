@@ -39,10 +39,18 @@ import ssm
 from rSLDS import *
 from io_manager import IOManager
 
+# Use all logical cores for Basic Linear Algebra Subprograms (BLAS) on Colab CPU
+from joblib import Parallel, delayed
+import multiprocessing
+n_cpu = multiprocessing.cpu_count()
+for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
+    os.environ[_k] = str(n_cpu)
+
+'''
 from joblib import Parallel, delayed
 for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
     os.environ.setdefault(_k, "1")
-
+'''
 
 # --------------------------------------------------------------------------------------
 # Data import
@@ -342,7 +350,8 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         summary=summary))
     
         return leaderboard_local[0], details_local[0], success_local
-    
+
+    '''
     n_jobs = CONFIG.get("n_jobs", -1)
     if n_jobs == 1 or len(combo_list) <= 1:
         for combo_idx, (r, b) in enumerate(combo_list, 1):
@@ -356,8 +365,7 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
     else:
         _results = Parallel(n_jobs=n_jobs, prefer="processes")(
             delayed(_worker_run)(combo_idx, r, b, verbose)
-            for combo_idx, (r, b) in enumerate(combo_list, 1)
-        )
+            for combo_idx, (r, b) in enumerate(combo_list, 1))
         for _out in _results:
             if _out is None:
                 continue
@@ -365,6 +373,19 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
             leaderboard.append(_leader)
             details.append(_detail)
             success += _succ
+    '''
+    
+    # Force sequential Python; use multi-threaded BLAS for speed
+    n_jobs = 1
+    for combo_idx, (r, b) in enumerate(combo_list, 1):
+        _out = _worker_run(combo_idx, r, b, verbose)
+        if _out is None:
+            continue
+        _leader, _detail, _succ = _out
+        leaderboard.append(_leader)
+        details.append(_detail)
+        success += _succ
+        
 
     if leaderboard:
         sorted_leaderboard = sorted(leaderboard, key=lambda d: d["score"], reverse=True)
@@ -917,7 +938,7 @@ def pipeline_actual(securities, CONFIG):
 def seed_stability_from_config(cfg, securities, filename):
     """
     One-call seed robustness check driven only by:
-      - cfg (RSLDS_CONFIG)
+      - cfg (rSLDS CONFIG)
       - securities (list of tickers)
       - filename (path handled by import_data)
 
