@@ -2,55 +2,47 @@
 # Import modules
 # --------------------------------------------------------------------------------------
 
+# 1) Env first (BLAS)
+import os, multiprocessing
+n_cpu = multiprocessing.cpu_count()
+for k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS",
+          "VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
+    os.environ[k] = str(n_cpu)   # or "1" for single-threaded BLAS
+os.environ["TQDM_NOTEBOOK"] = "0"  # fine to set before importing tqdm
+
+# 2) Heavy libs
 import numpy as np
 import numpy.random as npr
 import pandas as pd
-import re
-import json
-from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import confusion_matrix, precision_score, recall_score
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
 from scipy import stats
-from collections import Counter
-from itertools import groupby
-import matplotlib.pyplot as plt
-import itertools
-from fractions import Fraction
+from scipy.optimize import linear_sum_assignment
 from scipy.special import logsumexp
-import types
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, silhouette_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
-# switch of widgets before importing ssm
-import os
-os.environ["TQDM_NOTEBOOK"] = "0"   # no notebook widget
+# 3) No widges
 import tqdm
 import tqdm.auto as tqa
 from tqdm.std import tqdm as tqdm_std
 def _trange_no_widget(n, *a, **k):
-    k.setdefault("disable", True)          # True = no bars; False = console bars
-    return tqdm_std(range(n), *a, **k)     # real tqdm object (has set_description)
+    k.setdefault("disable", True)
+    return tqdm_std(range(n), *a, **k)
 tqdm.tqdm = tqdm_std
 tqdm.trange = _trange_no_widget
 tqa.tqdm = tqdm_std
 tqa.trange = _trange_no_widget
-import ssm
 
-from rSLDS import *
+# 4) Remaining imports
+import itertools, types, re, json
+from fractions import Fraction
+from collections import Counter
+from itertools import groupby
 from io_manager import IOManager
-
-# Use all logical cores for Basic Linear Algebra Subprograms (BLAS) on Colab CPU
 from joblib import Parallel, delayed
-import multiprocessing
-n_cpu = multiprocessing.cpu_count()
-for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
-    os.environ[_k] = str(n_cpu)
-
-'''
-from joblib import Parallel, delayed
-for _k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
-    os.environ.setdefault(_k, "1")
-'''
+import ssm
+from rSLDS import *
 
 # --------------------------------------------------------------------------------------
 # Data import
@@ -350,30 +342,6 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
         summary=summary))
     
         return leaderboard_local[0], details_local[0], success_local
-
-    '''
-    n_jobs = CONFIG.get("n_jobs", -1)
-    if n_jobs == 1 or len(combo_list) <= 1:
-        for combo_idx, (r, b) in enumerate(combo_list, 1):
-            _out = _worker_run(combo_idx, r, b, verbose)
-            if _out is None:
-                continue
-            _leader, _detail, _succ = _out
-            leaderboard.append(_leader)
-            details.append(_detail)
-            success += _succ
-    else:
-        _results = Parallel(n_jobs=n_jobs, prefer="processes")(
-            delayed(_worker_run)(combo_idx, r, b, verbose)
-            for combo_idx, (r, b) in enumerate(combo_list, 1))
-        for _out in _results:
-            if _out is None:
-                continue
-            _leader, _detail, _succ = _out
-            leaderboard.append(_leader)
-            details.append(_detail)
-            success += _succ
-    '''
     
     # Force sequential Python; use multi-threaded BLAS for speed
     n_jobs = 1
@@ -930,232 +898,3 @@ def pipeline_actual(securities, CONFIG):
 
     return {"Z_labels": Z_labels, "segments": Segs, "index": Idx,
             "meta": {"dt": CONFIG["dt"], "K_grid": CONFIG["K_grid"], "batch_grid": CONFIG["batch_grid"],},}
-            
-# --------------------------------------------------------------------------------------
-# Eval
-# --------------------------------------------------------------------------------------
-
-def seed_stability_from_config(cfg, securities, filename):
-    """
-    One-call seed robustness check driven only by:
-      - cfg (rSLDS CONFIG)
-      - securities (list of tickers)
-      - filename (path handled by import_data)
-
-    Uses helpers from gridsearch.py:
-      import_data, import_factors, _intersect_indexes, _build_restrictions
-    and your rSLDS functions in scope: fit_rSLDS, fit_rSLDS_restricted,
-      inference_rSLDS, cusum_overlay_basic.
-    Prints min/avg/max ranges and returns (model_df, outcome_ranges, details).
-    """
-    import numpy as np
-    import pandas as pd
-    from sklearn.metrics import adjusted_rand_score as _ari
-    from scipy.optimize import linear_sum_assignment
-
-    # --------- 0) choose spec from cfg ----------
-    best = cfg.get("best")
-    if best is not None:
-        restricted = (best.get("type", "restricted") == "restricted")
-        channels   = list(best["channels"])
-        K          = int(best["K"])
-        D          = int(best["D"])
-        C_type     = best.get("C_type", None)
-    else:
-        if cfg.get("run_restricted", False) and cfg.get("restricted_models"):
-            m = cfg["restricted_models"][0]
-            restricted = True
-        else:
-            m = cfg["unrestricted_models"][0]
-            restricted = False
-        channels = list(m["channels"])
-        D        = int(m["dim_latent"][0])
-        K        = int(cfg["K_grid"][0])
-        C_type   = m.get("C_type", None)
-
-    dt        = float(cfg.get("dt", 1.0/252.0))
-    n_iters   = int(cfg.get("n_iters", 10))
-    h_z       = float(cfg.get("h_z", 5.0))
-    master    = int(cfg.get("seed", 123))
-    n_runs    = int(cfg.get("n_runs", 10))
-
-    # --------- 1) data (helpers from gridsearch.py) ----------
-    px_all, eps_all, pe_all, ser_vix = import_data(cfg["data_excel"])
-    ff = import_factors(cfg["ff_dir"], cfg["ff_files"])
-
-    # per-security channel dict
-    def _series_by_sec(sec):
-        s_px  = px_all[sec].dropna()
-        s_eps = eps_all[sec].dropna()
-        s_pe  = pe_all[sec].dropna()
-        y = np.log(s_px).diff().rename("y")                # Δlog price
-        g = np.log(s_eps).diff().rename("g")               # Δlog EPS
-        v = np.log(s_pe).diff().rename("v")                # Δlog P/E
-        h = np.log(ser_vix).diff().rename("h")             # Δlog VIX
-        # factors (assumed % returns, already aligned by date index)
-        return {
-            "y": y, "g": g, "v": v, "h": h,
-            "mkt": ff["MKT"], "smb": ff["SMB"], "hml": ff["HML"],
-            "rmw": ff["RMW"] if "RMW" in ff else ff["HML"]*0.0,
-            "cma": ff["CMA"] if "CMA" in ff else ff["HML"]*0.0,
-            "mom": ff["MOM"] if "MOM" in ff else ff["MKT"]*0.0,
-        }
-
-    parts = []
-    for sec in securities:
-        bag = _series_by_sec(sec)
-        need = [bag[k] for k in channels]
-        idx  = _intersect_indexes(need)
-        if idx.empty:
-            raise ValueError(f"No overlap for {sec} with channels {channels}.")
-        parts.append(pd.concat([bag[k].reindex(idx) for k in channels], axis=1))
-
-    # global intersection across securities
-    common_idx = parts[0].index
-    for p in parts[1:]:
-        common_idx = common_idx.intersection(p.index)
-    parts = [p.reindex(common_idx) for p in parts]
-
-    # design matrix Y: concatenate securities side-by-side
-    Y = pd.concat(parts, axis=1).astype(float).values  # (T, N)
-    N = Y.shape[1]
-
-    # reference price for post-CUSUM (first security)
-    px_ref = px_all[securities[0]].reindex(common_idx).astype(float)
-
-    # --------- 2) params & (optional) restrictions ----------
-    params = dict(n_regimes=K, dim_latent=D, single_subspace=True)
-
-    C = d = C_mask = d_mask = None
-    b_pattern = None
-    if restricted:
-        base_channels = []
-        for _ in securities:
-            base_channels.extend(channels)
-        R = _build_restrictions(C_type, Y_obs=None, base_channels=base_channels, D=D)
-        C, d, C_mask, d_mask, b_pattern = R["C"], R["d"], R["C_mask"], R["d_mask"], R["b_pattern"]
-
-    # --------- 3) reproducible seeds ----------
-    rng = np.random.RandomState(master)
-    seeds = rng.randint(1, 2**31 - 1, size=n_runs).tolist()
-
-    # --------- 4) fit across seeds ----------
-    mdls, Z_pre_list, X_pre_list = [], [], []
-    cpll_runs = []
-    max_cpll_runs = []
-    for s in seeds:
-        if restricted:
-            _, _, _, _, mdl = fit_rSLDS_restricted(
-                Y, params,
-                C=C, d=d, C_mask=C_mask, d_mask=d_mask, b_pattern=b_pattern,
-                n_iter_em=n_iters, seed=s)
-        else:
-            _, _, _, _, mdl = fit_rSLDS(Y, params, n_iter_em=n_iters, seed=s)
-        mdls.append(mdl)
-
-        out = inference_rSLDS(px=None, mdl=mdl, y_test=Y, dt=dt, display=False)
-        Z_pre_list.append(out["zhat"])
-        X_pre_list.append(out["xhat"])
-        cpll_runs.append(float(out["cpll"]))
-        max_cpll_runs.append(float(out["max_cpll"]))
-
-    # --------- 5) regime alignment (Hungarian) on params ----------
-    def _extract(m):
-        Kk = m.dynamics.As.shape[0]
-        return dict(
-            A=np.array(m.dynamics.As, copy=True),
-            b=np.array(m.dynamics.bs, copy=True),
-            s2=np.array(m.dynamics.sigmasq, copy=True),
-            R=np.array(getattr(m.transitions, "Rs", np.zeros((Kk, D))), copy=True),
-            r=np.array(getattr(m.transitions, "r",  np.zeros(Kk)), copy=True),
-        )
-
-    def _vec(B, k):
-        return np.concatenate([
-            B["A"][k].ravel(),
-            B["b"][k].ravel(),
-            np.sqrt(B["s2"][k].ravel()),
-            B["R"][k].ravel(),
-            np.array([B["r"][k]]),
-        ])
-
-    blocks = [_extract(m) for m in mdls]
-    B0 = blocks[0]
-    aligned = [B0]
-    perms   = [np.arange(K, dtype=int)]
-
-    for B in blocks[1:]:
-        Cmat = np.zeros((K, K))
-        for i in range(K):
-            vi = _vec(B0, i)
-            for j in range(K):
-                vj = _vec(B, j)
-                Cmat[i, j] = np.sum((vi - vj) ** 2)
-        rows, cols = linear_sum_assignment(Cmat)
-        perm = np.zeros(K, dtype=int)
-        for i, j in zip(rows, cols):
-            perm[i] = j
-        aligned.append({k: (v[perm] if v.ndim > 0 and v.shape[0] == K else v) for k, v in B.items()})
-        perms.append(perm)
-
-    # --------- 6) MODEL param stability: min/avg/max of per-seed δ ---------
-    def _block_deltas(key):
-        St = np.stack([B[key] for B in aligned], axis=0)   # (S,K,...)
-        meanP = St.mean(axis=0)
-        num   = np.linalg.norm((St - meanP).reshape(St.shape[0], -1), axis=1)
-        denom = np.linalg.norm(meanP.ravel()) + 1e-12
-        return num / denom
-
-    rows = []
-    for key, publ in [("A","A"),("b","b"),("s2","sigmasq"),("R","Rs"),("r","r")]:
-        dlt = _block_deltas(key)
-        rows.append({"block": publ, "min": float(dlt.min()),
-                     "avg": float(dlt.mean()), "max": float(dlt.max())})
-    model_df = pd.DataFrame(rows).set_index("block").loc[["A","b","sigmasq","Rs","r"]]
-
-    # --------- 7) OUTCOME stability: pre-/post-CUSUM (min/avg/max) ---------
-    # post-CUSUM per seed
-    Z_post_list = []
-    for m, xhat, zhat in zip(mdls, X_pre_list, Z_pre_list):
-        z_cusum = cusum_overlay_basic(px_ref, y=Y, xhat=xhat, mdl=m, h_z=h_z, verbose=False)
-        Z_post_list.append(z_cusum if z_cusum is not None else zhat)
-
-    def _agreement_stats(Z_list):
-        Zm = np.stack(Z_list, axis=1)                # (T,S)
-        # mode across seeds per t
-        modes = np.apply_along_axis(lambda v: np.bincount(v).argmax(), 1, Zm)
-        agree = (Zm == modes[:, None]).mean(axis=1)
-        return dict(min=float(agree.min()), avg=float(agree.mean()), max=float(agree.max()))
-
-    def _ari_stats(Z_list):
-        ref = Z_list[0]
-        vals = np.array([_ari(ref, z) for z in Z_list])
-        return dict(min=float(vals.min()), avg=float(vals.mean()), max=float(vals.max()))
-
-    outcome_ranges = dict(
-        pre_agreement=_agreement_stats(Z_pre_list),
-        pre_ari=_ari_stats(Z_pre_list),
-        post_agreement=_agreement_stats(Z_post_list),
-        post_ari=_ari_stats(Z_post_list),
-    )
-
-    # --------- 8) print concise ranges ----------
-    print("\n=== MODEL PARAM STABILITY (δ per block) ===")
-    for blk, r in model_df.to_dict(orient="index").items():
-        print(f"{blk:8s}: min={r['min']:.4f}  avg={r['avg']:.4f}  max={r['max']:.4f}")
-
-    print("\n=== OUTCOME STABILITY ===")
-    for lbl, stats in outcome_ranges.items():
-        print(f"{lbl:14s}: min={stats['min']:.4f}  avg={stats['avg']:.4f}  max={stats['max']:.4f}")
-
-    # --------- 9) details payload ----------
-    details = dict(
-        seeds=seeds,
-        permutations=perms,
-        spec=dict(restricted=restricted, K=K, D=D, channels=channels,
-                  securities=securities, C_type=C_type, dt=dt, n_iters=n_iters, h_z=h_z),
-    )
-
-    return model_df, outcome_ranges, details
-
-
