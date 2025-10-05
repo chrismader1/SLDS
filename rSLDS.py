@@ -1658,7 +1658,7 @@ def print_rSLDS_matrices(model, restricted=False, dt=None, latent_names=None):
             print(f"[{row_str}]")
         print()
 
-    # Matrix dumps (identical to OLD)
+    # Matrix dumps
     pmat(model.emissions.Cs, "Cs", "Cs")
     pmat(model.emissions.ds, "ds", "ds")
     pmat(model.emissions.inv_etas, "inv_etas", "inv_etas")
@@ -1668,7 +1668,7 @@ def print_rSLDS_matrices(model, restricted=False, dt=None, latent_names=None):
     pmat(model.transitions.Rs, "Rs", "Rs")
     pmat(model.transitions.r, "r", "r")
 
-    # Regime-type classification (identical to OLD)
+    # Regime-type classification
     print("Dynamics: xₜ = a⋅xₜ₋₁ + b + ε")
     print()
     print("Inferred Regime Types:")
@@ -2036,4 +2036,3 @@ def infer_params_from_model(model, mu_true, sigma_true, sigma_diff_true, dt=1/25
     })
     df = df.set_index(pd.Index([0, 1], name="regime"))
     print(df)
-
