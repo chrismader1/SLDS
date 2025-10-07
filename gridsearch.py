@@ -189,6 +189,8 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
     
         while t0 < T:
             end_t = min(t0 + train_window, T)
+            predict_oos = CONFIG.get("predict_oos", True)
+            test_window = train_window - overlap
             y_tr = y[t0:end_t]
             y_tr = y_tr.reshape(-1, 1) if y_tr.ndim == 1 else y_tr
     
@@ -237,24 +239,24 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
                 xhat_all.append(xhat[overlap_eff:])
                 zhat_cusum_all.append(zhat_cus[overlap_eff:])
                 retained_idx.extend(range(t0 + overlap_eff, end_t))
-    
-            # ---- Ex-ante (discrete-only seed) on next overlap window
-            if (end_t < T) and (overlap > 0):
-                t2_end = min(end_t + overlap, T)
+
+            # ---- Optional out-of-sample forecast
+            if predict_oos and (end_t < T):
+                t2_end = min(end_t + test_window, T)
                 if t2_end > end_t:
                     y_te = y[end_t:t2_end]
                     y_te = y_te.reshape(-1, 1) if y_te.ndim == 1 else y_te
             
-                    # save + seed discrete init only
+                    # seed discrete prior
                     pi0_orig = getattr(model.init_state_distn, "pi", None)
                     model.init_state_distn.pi = gamma_T / max(gamma_T.sum(), 1e-12)
             
-                    # ssm posterior (no refit)
-                    T2   = len(y_te)
-                    Fs   = getattr(model.emissions, "Fs", [])
+                    # posterior (no refit)
+                    T2 = len(y_te)
+                    Fs = getattr(model.emissions, "Fs", [])
                     D_in = Fs[0].shape[1] if len(Fs) else 0
                     inputs2 = np.zeros((T2, D_in))
-                    mask2 = np.ones_like(y_te, dtype=bool)              # (T2, N)
+                    mask2 = np.ones_like(y_te, dtype=bool)
                     q_te = model._make_variational_posterior(
                         variational_posterior="structured_meanfield",
                         datas=[y_te], inputs=[inputs2], masks=[mask2], tags=[None], method="smf")
@@ -272,7 +274,7 @@ def gridsearch_actual(y, px, r_grid, CONFIG, seed=None):
             if end_t == T:
                 pass
                 # break
-            t0 += train_window - overlap
+            t0 += test_window
             if end_t == T:
                 break
     
