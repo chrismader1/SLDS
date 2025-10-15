@@ -6,6 +6,18 @@ from scipy import stats
 from scipy.optimize import linear_sum_assignment
 from gridsearch import *
 
+try:
+    import cupy as xp
+    from cupyx.scipy.optimize import linear_sum_assignment  # GPU Hungarian
+    from cupyx.scipy import stats as xp_stats               # for stats
+    GPU = True
+except Exception:
+    import numpy as xp
+    from scipy.optimize import linear_sum_assignment
+    from scipy import stats as xp_stats
+    GPU = False
+
+
 # ---------------------------------------------------------------
 # Wasserstein helper functions
 # ---------------------------------------------------------------
@@ -269,7 +281,6 @@ def fit_regime_dro(data, params, G):
             R_source  = R_seg                         # << keep regime-k distribution
     
         # pass full-sample N via n_ref but bootstrap from R_source
-        ### params_k = dict(params); params_k["n_ref"] = n_days
         params_k = dict(params); params_k["n_ref"] = (b - a)   # use segment length
 
         delta_k = compute_delta(params_k.get("kappa", 1.0), mu_est, Sigma_est, R_source, params_k)
@@ -1164,7 +1175,8 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
     paramsA = dict(DELTA_DEFAULTS[DRO_CONFIG["delta_name"]])
     fitA = fit_dro(dataA, paramsA, DRO_CONFIG["GLOBAL"])
     assert len(fitA["w"]) == N, f"len(w)={len(fitA['w'])} != N={N} from DATA_A"
-    summA = evaluate_portfolio({"type": "static", "w": fitA["w"]}, dataA, DRO_CONFIG["GLOBAL"])
+    summA = evaluate_portfolio(fitA, dataA, DRO_CONFIG["GLOBAL"]) # pass the full fit so delta, kappa are recorded
+
     # Part A daily portfolio returns (on intersection calendar)
     partA_daily = pd.Series(
         dataA["train"] @ np.asarray(fitA["w"]).reshape(-1),
@@ -1312,20 +1324,29 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         paramsR = dict(DELTA_DEFAULTS[DRO_CONFIG["delta_name"]])
         paramsR["use_moments_override"] = True
 
-        w_sub = np.asarray(fit_dro(data_k, paramsR, DRO_CONFIG["GLOBAL"])["w"]).reshape(-1)
-
+        fit_k = fit_dro(data_k, paramsR, DRO_CONFIG["GLOBAL"])
+        w_sub = np.asarray(fit_k["w"]).reshape(-1)
+        delta_k = float(fit_k.get("delta", np.nan))
+        
         # expand to full vector
         w_full = np.zeros(len(names_all))
         pos = {n: i for i, n in enumerate(names_all)}
         for j, n in enumerate(A_k):
             w_full[pos[n]] = w_sub[j]
         w_list.append(w_full)
+        
+        # collect per-segment deltas
+        if "seg_deltas" not in locals():
+            seg_deltas = []
+        seg_deltas.append(delta_k)
+
 
     fitB = {
         "type": "piecewise",
         "w_list": [np.asarray(w, float) for w in w_list],
         "segs": np.asarray(taus, dtype=np.int64),
-        "names": names_all
+        "names": names_all,
+        "delta_list": seg_deltas,
     }
 
     # evaluation uses the union calendar
