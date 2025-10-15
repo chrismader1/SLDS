@@ -1,10 +1,8 @@
-
-
 # ---------------------------------------------------------------
-# GPU
+# Import modules
 # ---------------------------------------------------------------
 
-
+# GPU if available
 try:
     import cupy as xp
     from cupyx.scipy.optimize import linear_sum_assignment  # GPU Hungarian
@@ -15,19 +13,16 @@ except Exception:
     from scipy.optimize import linear_sum_assignment
     from scipy import stats as xp_stats
     GPU = False
-
-
-
 print(f"GPU={GPU}")
 
+# Others
 import hashlib
 import pandas as pd
 import matplotlib.pyplot as plt
 import cvxpy as cp
-from scipy import stats
-from scipy.optimize import linear_sum_assignment
-
-
+import os, re, ast
+import pickle, gzip
+from scipy import stats as sp_stats
 
 # ---------------------------------------------------------------
 # Wasserstein helper functions
@@ -40,16 +35,16 @@ def _rng_from_params(params):
 
 def _sqrtm_psd(A, eps=1e-12):
     """Symmetric PSD principal square root via eigen-decomposition."""
-    vals, vecs = np.linalg.eigh(0.5*(A + A.T))
-    vals = np.clip(vals, 0.0, None)
-    return (vecs * np.sqrt(vals + eps)) @ vecs.T
+    vals, vecs = xp.linalg.eigh(0.5*(A + A.T))
+    vals = xp.clip(vals, 0.0, None)
+    return (vecs * xp.sqrt(vals + eps)) @ vecs.T
 
 def w2_empirical_uniform_exact(X, Y):
     """
     Exact W2 between two uniform empirical measures with the same number of points.
     Returns W2 (not squared). Uses Hungarian assignment on squared Euclidean costs.
     """
-    X = np.asarray(X, float); Y = np.asarray(Y, float)
+    X = xp.asarray(X, float); Y = xp.asarray(Y, float)
     n, d = X.shape
     m, d2 = Y.shape
     assert d == d2, "X and Y must have the same dimension"
@@ -57,7 +52,7 @@ def w2_empirical_uniform_exact(X, Y):
     # cost matrix C_{ij} = ||x_i - y_j||^2
     C = ((X[:, None, :] - Y[None, :, :])**2).sum(axis=2)
     r, c = linear_sum_assignment(C)
-    return float(np.sqrt(C[r, c].mean()))
+    return float(xp.sqrt(C[r, c].mean()).item())
 
 def wasserstein2_gaussian(mu1, Sigma1, mu2, Sigma2, eps=1e-12):
     """
@@ -65,49 +60,128 @@ def wasserstein2_gaussian(mu1, Sigma1, mu2, Sigma2, eps=1e-12):
       ||mu1-mu2||^2 + tr(S1 + S2 - 2 (S2^{1/2} S1 S2^{1/2})^{1/2})
     Returns W2 (not squared).
     """
-    dmu2 = float(np.dot(mu1 - mu2, mu1 - mu2))
+    dmu2 = float(xp.dot(mu1 - mu2, mu1 - mu2))
     S2h = _sqrtm_psd(Sigma2, eps=eps)
     mid = S2h @ Sigma1 @ S2h
     midh = _sqrtm_psd(mid, eps=eps)
-    trpart = float(np.trace(Sigma1 + Sigma2 - 2.0 * midh))
+    trpart = float(xp.trace(Sigma1 + Sigma2 - 2.0 * midh))
     w2_sq = max(dmu2 + trpart, 0.0)
-    return float(np.sqrt(w2_sq))
+    return float(xp.sqrt(w2_sq))
 
-def sliced_w2_empirical(X, Y, n_proj=64, rng=None):
+    
+def sliced_w2_empirical_OLD(X, Y, n_proj=64, rng=None):
     """
     Approximate multivariate W2 by averaging 1D W2 across random directions.
     X, Y: (n,d) samples with same n preferred (bootstrap uses same n).
     Returns W2 (not squared).
     """
     rng = _rng_from_params({}) if rng is None else rng
-    X = np.asarray(X); Y = np.asarray(Y)
+    X = xp.asarray(X); Y = xp.asarray(Y)
     n, d = X.shape
     assert Y.shape[1] == d
     m = Y.shape[0]
     w2_sq = 0.0
     for _ in range(int(n_proj)):
-        u = rng.normal(size=d); u /= max(np.linalg.norm(u), 1e-12)
-        x = np.sort(X @ u)
-        y = np.sort(Y @ u)
+        u = rng.normal(size=d); u /= max(xp.linalg.norm(u), 1e-12)
+        x = xp.sort(X @ u)
+        y = xp.sort(Y @ u)
         if m != n:
             # match quantiles if sizes differ
-            q = np.linspace(0, 1, min(n, m), endpoint=True)
-            xq = np.quantile(x, q); yq = np.quantile(y, q)
+            q = xp.linspace(0, 1, min(n, m), endpoint=True)
+            xq = xp.quantile(x, q); yq = xp.quantile(y, q)
             diff = xq - yq
         else:
             diff = x - y
-        w2_sq += float(np.mean(diff*diff))
+        w2_sq += float(xp.mean(diff*diff))
     w2_sq /= float(n_proj)
-    return float(np.sqrt(max(w2_sq, 0.0)))
+    return float(xp.sqrt(max(w2_sq, 0.0)))
+
+def sliced_w2_empirical(X, Y, n_proj=256, rng=None):
+    """
+    Approximate multivariate W2 by averaging 1D W2 across random directions.
+    X, Y: (n,d) samples with same n preferred (bootstrap uses same n).
+    Returns W2 (not squared).
+    """
+    rng = _rng_from_params({}) if rng is None else rng
+    X = xp.asarray(X); Y = xp.asarray(Y)
+    n, d = X.shape; m = Y.shape[0]
+
+    U = rng.normal(size=(n_proj, d))
+    U = xp.asarray(U)
+    U = U / xp.maximum(xp.linalg.norm(U, axis=1, keepdims=True), 1e-12)
+
+    XU = X @ U.T         # (n, P)
+    YU = Y @ U.T         # (m, P)
+    XU = xp.sort(XU, axis=0)
+    YU = xp.sort(YU, axis=0)
+
+    if m != n:
+        q = xp.linspace(0, 1, min(n, m))
+        XU = xp.quantile(XU, q, axis=0)
+        YU = xp.quantile(YU, q, axis=0)
+
+    diff = XU - YU
+    w2_sq = xp.mean(diff*diff)
+    return float(xp.sqrt(xp.maximum(w2_sq, 0.0)).item())
 
 def _mvnrnd_psd(mu, Sigma, n, rng, eps=1e-9):
     """Draw n samples ~ N(mu, Sigma) with PSD projection; avoids SVD path."""
-    mu = np.asarray(mu, float); d = mu.size
+    mu = xp.asarray(mu, float); d = mu.size
     S  = 0.5*(Sigma + Sigma.T)
-    vals, vecs = np.linalg.eigh(S)
-    L = (vecs * np.sqrt(np.clip(vals, eps, None))) @ vecs.T
+    vals, vecs = xp.linalg.eigh(S)
+    L = (vecs * xp.sqrt(xp.clip(vals, eps, None))) @ vecs.T
     Z = rng.normal(size=(n, d))
     return mu + Z @ L.T
+
+def _cov_batched(Xb: "xp.ndarray[B,n,d]"):
+    """
+    Batched sample mean & covariance on device.
+    Returns (mub[B,d], Sb[B,d,d]) with ddof=1 and symmetrization.
+    """
+    B, n, d = Xb.shape
+    mub = Xb.mean(axis=1)                       # (B, d)
+    C   = Xb - mub[:, None, :]                  # (B, n, d)
+    # einsum over batches: sum_k C_{b,k,:} C_{b,k,:}^T
+    Sb  = xp.einsum('bij,bik->bjk', C, C) / max(n - 1, 1)
+    # enforce symmetry (numerical)
+    Sb  = 0.5 * (Sb + xp.transpose(Sb, (0, 2, 1)))
+    return mub, Sb
+
+
+def bootstrap_gaussian_delta(R, alpha=0.05, B=512, eps=1e-9, rng=None):
+    """
+    Batched Gaussian bootstrap for Wasserstein δ.
+    All math stays on device (CuPy if available).
+    """
+    rng = _rng_from_params({}) if rng is None else rng
+
+    X = xp.asarray(R, float)
+    n, d = X.shape
+    if n < 2:
+        return 0.0
+
+    # reference moments
+    mu0 = xp.mean(X, axis=0)                    # (d,)
+    Xc  = X - mu0
+    S0  = (Xc.T @ Xc) / (n - 1)                 # (d,d)
+    L   = _sqrtm_psd(S0, eps)                   # S0^{1/2}; L @ L = S0
+
+    # batched draws on device
+    Z   = xp.asarray(rng.normal(size=(B, n, d)))    # CPU->GPU once
+    Xb  = mu0 + Z @ L.T                              # (B,n,d)
+
+    # batched moments on device
+    mub, Sb = _cov_batched(Xb)                       # (B,d), (B,d,d)
+
+    # Gelbrich W2 across batches (loop over B, typically cheap)
+    deltas = xp.empty(B, dtype=float)
+    for b in range(B):
+        deltas[b] = wasserstein2_gaussian(mu0, S0, mub[b], Sb[b], eps)
+
+    # upper (1 - alpha) quantile
+    return float(xp.quantile(deltas, 1.0 - alpha))
+
+
 
 # ---------------------------------------------------------------
 # Optimization
@@ -132,17 +206,17 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
 
     # ----- κ-based rules
     if method == "kappa_rate":
-        d     = int(np.size(mu_est))
+        d     = int(xp.size(mu_est))
         n_obs = int(R.shape[0]) if (R is not None and hasattr(R, "shape")) else 1
         n_eff = int((params or {}).get("n_ref", n_obs))
-        sbar  = float(np.sqrt(np.trace(Sigma) / max(d, 1))) if Sigma is not None else 0.0
-        return kappa * sbar * np.sqrt(d / max(n_eff, 1))
+        sbar  = float(xp.sqrt(xp.trace(Sigma) / max(d, 1))) if Sigma is not None else 0.0
+        return kappa * sbar * xp.sqrt(d / max(n_eff, 1))
 
     if method == "fixed":
         return float((params or {}).get("delta", 0.0))
     
     if method == "kappa_l2":
-        return kappa * float(np.linalg.norm(mu_est, 2))
+        return kappa * float(xp.linalg.norm(mu_est, 2))
 
     # ----- non-κ rules (ignore kappa)
     if method == "bound_ek":
@@ -152,8 +226,8 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         a     = float((params or {}).get("a", 2.0))
         n_obs = int(R.shape[0]) if (R is not None and hasattr(R, "shape")) else 1
         n     = int((params or {}).get("n_ref", n_obs))
-        d     = int(np.size(mu_est))
-        num   = np.log(c1 / max(alpha, 1e-12))
+        d     = int(xp.size(mu_est))
+        num   = xp.log(c1 / max(alpha, 1e-12))
         den   = c2 * max(n, 1)
         thresh= num / max(c2, 1e-12)
         base  = max(num / max(den, 1e-12), 1e-12)
@@ -174,32 +248,15 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
             idx = rng.integers(0, n_src, size=n_boot)
             Rb = R[idx]
             dists.append(w2_empirical_uniform_exact(R, Rb))
-        return float(np.quantile(np.asarray(dists), 1.0 - alpha))
+        return float(xp.quantile(xp.asarray(dists), 1.0 - alpha))
 
     if method == "bootstrap_gaussian":
         assert R is not None, "bootstrap_gaussian needs raw sample matrix R."
-        alpha  = float((params or {}).get("alpha", 0.05))
-        B      = int((params or {}).get("B", 200))
-        rng    = _rng_from_params(params or {})
-        n_src, d = R.shape
-        if n_src < 2:
-            return 0.0
-        # Set bootstrap sample size equal to regime size, in line with non-parametric bootstrap
-        n_boot = n_src
-
-        mu0   = np.mean(R, axis=0)
-        S0    = np.cov(R.T, ddof=1)
+        alpha = float((params or {}).get("alpha", 0.05))
+        B     = int((params or {}).get("B", 512))
         eps   = float((params or {}).get("epsilon_sigma", 1e-9))
-        S0p = 0.5*(S0 + S0.T)
-        vals, vecs = np.linalg.eigh(S0p)
-        S0p = (vecs * np.clip(vals, eps, None)) @ vecs.T
-        deltas = []
-        for _ in range(B):
-            Xb  = _mvnrnd_psd(mu0, S0p, n_boot, rng, eps=eps)
-            mub = np.mean(Xb, axis=0)
-            Sb  = np.cov(Xb.T, ddof=1)
-            deltas.append(wasserstein2_gaussian(mu0, S0p, mub, Sb, eps=eps))
-        return float(np.quantile(np.asarray(deltas), 1.0 - alpha))
+        rng   = _rng_from_params(params or {})
+        return bootstrap_gaussian_delta(R, alpha=alpha, B=B, eps=eps, rng=rng)
     
     raise ValueError(f"Unknown delta_method='{method}'")
     
@@ -207,37 +264,41 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
 def psd_cholesky(Sigma, eps):
     """Symmetrize, regularize to PSD, then return Cholesky factor L s.t. L.T @ L ≈ Sigma_psd."""
     Sigma_sym = 0.5 * (Sigma + Sigma.T)                 # symmetrize
-    Sigma_reg = Sigma_sym + eps * np.eye(Sigma_sym.shape[0])  # regularize
+    Sigma_reg = Sigma_sym + eps * xp.eye(Sigma_sym.shape[0])  # regularize
     try:
-        L = np.linalg.cholesky(Sigma_reg)
+        L = xp.linalg.cholesky(Sigma_reg)
         return L
-    except np.linalg.LinAlgError:
-        vals, vecs = np.linalg.eigh(Sigma_sym)
-        vals = np.clip(vals, eps, None)                 # floor small/negative eigenvalues
-        Sigma_psd = vecs @ np.diag(vals) @ vecs.T + eps * np.eye(Sigma_sym.shape[0])
-        L = np.linalg.cholesky(Sigma_psd)
+    except xp.linalg.LinAlgError:
+        vals, vecs = xp.linalg.eigh(Sigma_sym)
+        vals = xp.clip(vals, eps, None)                 # floor small/negative eigenvalues
+        Sigma_psd = vecs @ xp.diag(vals) @ vecs.T + eps * xp.eye(Sigma_sym.shape[0])
+        L = xp.linalg.cholesky(Sigma_psd)
         return L
 
 def solve_optimizer(mu, Sigma, delta, config, verbose=False):
-    n = len(mu)
-    rb = config["risk_budget"]
-    eps = config["epsilon_sigma"]
+    import numpy as _np
+    n = len(mu); rb = config["risk_budget"]; eps = config["epsilon_sigma"]
 
-    L = psd_cholesky(Sigma, eps)
+    # do algebra on GPU/CPU with xp, but convert to NumPy for CVXPY
+    L_xp = psd_cholesky(Sigma, eps)
+    L = _np.asarray(L_xp)                   # <- host copy
+    mu = _np.asarray(mu)
+    # Sigma isn't used directly by CVXPY; no need to convert unless you do
 
     w = cp.Variable(n)
     constraints = [cp.norm(L @ w, 2) <= rb, cp.sum(w) == 1]
-    objective = cp.Maximize(mu @ w - delta * cp.norm(w, 2))
+    objective   = cp.Maximize(mu @ w - delta * cp.norm(w, 2))
     prob = cp.Problem(objective, constraints)
 
-    try:
+    if GPU:
+        prob.solve(solver=cp.SCS, gpu=True, verbose=verbose,
+                   max_iters=20000, eps=1e-5, acceleration_lookback=10)
+    else:
         prob.solve(solver=cp.MOSEK, verbose=verbose)
-        if w.value is not None and prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-            return np.asarray(w.value).reshape(-1)
-    except cp.SolverError:
-        print(f"[ERROR] MOSEK solver failed: status={prob.status}")
-    return None
 
+    if w.value is None or prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        return None
+    return xp.asarray(w.value).reshape(-1)
 
 # ---------------------------------------------------------------
 # Fitting
@@ -255,7 +316,7 @@ def fit_dro(data, params, G):
                           data["mu_ann_full"], data["Sigma_ann_full"], data["train"], params)
     w = solve_optimizer(data["mu_ann_full"], data["Sigma_ann_full"], delta,
                         {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
-    return {"type": "static", "w": w, "kappa": params.get("kappa", np.nan), "delta": float(delta)}
+    return {"type": "static", "w": w, "kappa": params.get("kappa", xp.nan), "delta": float(delta)}
 
 
 def fit_regime_dro(data, params, G):
@@ -286,9 +347,9 @@ def fit_regime_dro(data, params, G):
             mu_est, Sigma_est = data["mu_ann_full"], data["Sigma_ann_full"]
             R_source = data["train"]                 # degenerate short segment
         else:
-            log_seg   = np.log1p(R_seg)
-            mu_est    = np.expm1(log_seg.mean(axis=0) * AF)
-            Sigma_est = np.cov(log_seg.T, ddof=1) * AF
+            log_seg   = xp.log1p(R_seg)
+            mu_est    = xp.expm1(log_seg.mean(axis=0) * AF)
+            Sigma_est = xp.cov(log_seg.T, ddof=1) * AF
             R_source  = R_seg                         # << keep regime-k distribution
     
         # pass full-sample N via n_ref but bootstrap from R_source
@@ -301,9 +362,9 @@ def fit_regime_dro(data, params, G):
         deltas.append(float(delta_k)); w_list.append(w_k)
         
     return {"type": "piecewise", "w_list": w_list, "segs": segs,
-            "kappa": params.get("kappa", np.nan),
+            "kappa": params.get("kappa", xp.nan),
             "delta_list": deltas,
-            "delta": np.nan}
+            "delta": xp.nan}
 
 
 def fit_dro_reverse(data, params, G):
@@ -314,7 +375,7 @@ def fit_dro_reverse(data, params, G):
     delta = float(params["delta"])
     w = solve_optimizer(data["mu_ann_full"], data["Sigma_ann_full"], delta,
                         {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
-    return {"type": "static", "w": w, "delta": delta, "kappa": np.nan}
+    return {"type": "static", "w": w, "delta": delta, "kappa": xp.nan}
 
 
 def fit_regime_dro_reverse(data, params, G):
@@ -339,15 +400,15 @@ def fit_regime_dro_reverse(data, params, G):
         if (b - a) < 2:
             mu_est = data["mu_ann_full"]; Sigma_est = data["Sigma_ann_full"]
         else:
-            log_seg = np.log1p(R)
-            mu_est  = np.expm1(log_seg.mean(axis=0) * AF)
-            Sigma_est = np.cov(log_seg.T, ddof=1) * AF
+            log_seg = xp.log1p(R)
+            mu_est  = xp.expm1(log_seg.mean(axis=0) * AF)
+            Sigma_est = xp.cov(log_seg.T, ddof=1) * AF
         w_k = solve_optimizer(mu_est, Sigma_est, delta_list[j],
                               {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
         w_list.append(w_k)
 
     return {"type": "piecewise", "w_list": w_list, "segs": segs,
-            "delta_list": delta_list, "kappa": np.nan}
+            "delta_list": delta_list, "kappa": xp.nan}
 
 
 def fit_regime_dro_rev_constSigma(data, params, G):
@@ -356,8 +417,8 @@ def fit_regime_dro_rev_constSigma(data, params, G):
     w_list = []
     for j, (a, b) in enumerate(zip(segs[:-1], segs[1:])):
         R_seg = data["train"][a:b]
-        log_seg = np.log1p(R_seg)
-        mu_est  = np.expm1(log_seg.mean(axis=0) * data["n_days"])
+        log_seg = xp.log1p(R_seg)
+        mu_est  = xp.expm1(log_seg.mean(axis=0) * data["n_days"])
         w = solve_optimizer(mu_est, Sigma_fix, float(params["delta_list"][j]),
                             {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
         w_list.append(w)
@@ -375,13 +436,13 @@ def evaluate_portfolio(fit, data, G):
     if fit["type"] == "static":
         stats_oos = portfolio_stats(fit["w"], test, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], 
                                                      "risk_budget": G["risk_budget"], "annualization_factor": AF})
-        ge = float(np.sum(np.abs(fit["w"])))
+        ge = float(xp.sum(xp.abs(fit["w"])))
         port_tr = train @ fit["w"]
         _, risk_tr, _ = stats_from_series(port_tr, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
         stats_oos["gross_exp"] = ge
         stats_oos["gap"] = float(stats_oos["sigma_ann"] - risk_tr)
-        stats_oos["kappa"] = float(fit.get("kappa", np.nan))
-        stats_oos["delta"] = float(fit.get("delta", np.nan))
+        stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
+        stats_oos["delta"] = float(fit.get("delta", xp.nan))
         rebal = [0, n_days]
         stats_oos["avg_holding_per"] = _avg_holding_period_from_marks(rebal)
         return stats_oos
@@ -389,21 +450,21 @@ def evaluate_portfolio(fit, data, G):
     else:  # piecewise
         cfg = {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "risk_budget": G["risk_budget"], "annualization_factor": AF}
         stats_oos = portfolio_stats_multipiece(fit["w_list"], fit["segs"], test, cfg)
-        seg_lengths = np.diff(np.array(fit["segs"]))
-        ge = float(np.sum(seg_lengths * np.array([np.sum(np.abs(wk)) for wk in fit["w_list"]])) / n_days)
+        seg_lengths = xp.diff(xp.array(fit["segs"]))
+        ge = float(xp.sum(seg_lengths * xp.array([xp.sum(xp.abs(wk)) for wk in fit["w_list"]])) / n_days)
 
-        port_tr = np.zeros(n_days)
+        port_tr = xp.zeros(n_days)
         for (a,b), wk in zip(zip(fit["segs"][:-1], fit["segs"][1:]), fit["w_list"]):
             port_tr[a:b] = train[a:b] @ wk
         _, risk_tr, _ = stats_from_series(port_tr, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
 
         stats_oos["gross_exp"] = ge
         stats_oos["gap"] = float(stats_oos["sigma_ann"] - risk_tr)
-        stats_oos["kappa"] = float(fit.get("kappa", np.nan))
+        stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
 
         # REPORT PER-SEGMENT DELTAS; DO NOT AVERAGE
         dlist = list(map(float, fit.get("delta_list", [])))
-        stats_oos["delta"] = np.nan                 # leave single 'delta' empty for Regime-DRO
+        stats_oos["delta"] = xp.nan                 # leave single 'delta' empty for Regime-DRO
         for j, dj in enumerate(dlist, start=1):     # expose delta_k1, delta_k2, ...
             stats_oos[f"delta_k{j}"] = dj
         rebal = list(fit.get("segs", []))
@@ -434,8 +495,8 @@ def evaluate_regime_independently(fit, data, G):
         seg_length = b - a
         
         # Define default values for empty/trivial segments
-        mu_seg, sigma_seg, sharpe_seg, vol_breach_seg = np.nan, np.nan, np.nan, np.nan
-        gross_exp_seg = np.sum(np.abs(wk))
+        mu_seg, sigma_seg, sharpe_seg, vol_breach_seg = xp.nan, xp.nan, xp.nan, xp.nan
+        gross_exp_seg = xp.sum(xp.abs(wk))
 
         if seg_length > 1:
             # 1. Isolate the segment's out-of-sample data
@@ -465,28 +526,29 @@ def stats_from_series(port_daily, config):
     rf_annual = config["risk_free_rate"]
     AF = int(config.get("annualization_factor", n_days))  # fallback to old behavior if not set
     rf_daily = (1 + rf_annual) ** (1 / AF) - 1
-    sigma_daily = np.std(port_daily, ddof=1)
-    sigma_annual = sigma_daily * np.sqrt(AF)
-    mu_annual_geom = np.exp(AF * np.mean(np.log1p(port_daily))) - 1
-    sharpe_annual = (np.mean(port_daily) - rf_daily) / sigma_daily * np.sqrt(AF) if sigma_daily > 0 else np.nan
-    return mu_annual_geom, sigma_annual, sharpe_annual
+    sigma_daily = xp.std(port_daily, ddof=1)
+    sigma_annual = sigma_daily * xp.sqrt(AF)
+    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(port_daily))) - 1
+    sharpe_annual = (xp.mean(port_daily) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
+    return float(mu_annual_geom), float(sigma_annual), float(sharpe_annual)
+
 
 def _max_drawdown_from_series(port_daily):
     """
     Max drawdown of a daily-return series.
     Returns the minimum (most negative) drawdown, e.g. -0.27 for -27%.
     """
-    x = np.asarray(port_daily, float)
+    x = xp.asarray(port_daily, float)
     if x.size == 0:
         return float("nan")
-    equity = np.cumprod(1.0 + x)
-    peak = np.maximum.accumulate(equity)
+    equity = xp.cumprod(1.0 + x)
+    peak = xp.maximum.accumulate(equity)
     dd = equity / peak - 1.0
-    return float(np.min(dd))
+    return float(xp.min(dd))
 
 def portfolio_stats(weights, returns, config):
     """Static weights over full horizon."""
-    weights = np.asarray(weights).reshape(-1)
+    weights = xp.asarray(weights).reshape(-1)
     port_daily = returns @ weights
     mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
@@ -505,10 +567,10 @@ def portfolio_stats_multipiece(w_list, taus, returns, config):
     """
     n_days = config["n_days"]
     assert taus[0] == 0 and taus[-1] == n_days and len(w_list) == len(taus) - 1
-    port_daily = np.empty(n_days, dtype=float)
+    port_daily = xp.empty(n_days, dtype=float)
     for k in range(len(w_list)):
         a, b = taus[k], taus[k + 1]
-        port_daily[a:b] = returns[a:b] @ np.asarray(w_list[k]).reshape(-1)
+        port_daily[a:b] = returns[a:b] @ xp.asarray(w_list[k]).reshape(-1)
     mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
     max_dd = _max_drawdown_from_series(port_daily)
@@ -529,25 +591,25 @@ def format_ci(mean, std):
 def paired_onesided_less(x, y):
     # H0: mean(x - y) >= 0  vs  H1: mean(x - y) < 0
     d = x - y
-    t, p = stats.ttest_1samp(d, popmean=0.0, alternative="less")
+    t, p = sp_stats.ttest_1samp(d, popmean=0.0, alternative="less")
     return t, p
 
 def paired_t_twosided(x, y):
     # H0: mean(x - y) == 0  vs  H1: ≠ 0
     d = x - y
-    t, p = stats.ttest_1samp(d, popmean=0.0, alternative="two-sided")
+    t, p = sp_stats.ttest_1samp(d, popmean=0.0, alternative="two-sided")
     return t, p
 
 def noninferiority_paired(x, y, delta):
     # H0: mean(x - y) <= -delta  vs  H1: > -delta
     d = (x - y) + delta
-    t, p = stats.ttest_1samp(d, popmean=0.0, alternative="greater")
+    t, p = sp_stats.ttest_1samp(d, popmean=0.0, alternative="greater")
     return t, p
 
 def superiority_paired(x, y):
     # H0: mean(x - y) <= 0  vs  H1: > 0
     d = x - y
-    t, p = stats.ttest_1samp(d, popmean=0.0, alternative="greater")
+    t, p = sp_stats.ttest_1samp(d, popmean=0.0, alternative="greater")
     return t, p
 
 def paired_two_sided_test_with_ci(x, y, alpha=0.05):
@@ -557,11 +619,11 @@ def paired_two_sided_test_with_ci(x, y, alpha=0.05):
     """
     d = x - y
     n = len(d)
-    mean_diff = np.mean(d)
-    sd = np.std(d, ddof=1)
-    se = sd / np.sqrt(n)
-    t, p = stats.ttest_1samp(d, popmean=0.0, alternative="two-sided")
-    tcrit = stats.t.ppf(1 - alpha / 2, df=n - 1)
+    mean_diff = xp.mean(d)
+    sd = xp.std(d, ddof=1)
+    se = sd / xp.sqrt(n)
+    t, p = sp_stats.ttest_1samp(d, popmean=0.0, alternative="two-sided")
+    tcrit = sp_stats.t.ppf(1 - alpha / 2, df=n - 1)
     ci_low, ci_high = mean_diff - tcrit * se, mean_diff + tcrit * se
     return dict(mean_diff=mean_diff, t=t, p=p, ci_low=ci_low, ci_high=ci_high, n=n)
 
@@ -756,11 +818,11 @@ def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sig
     n_days, n_assets = returns_train.shape
     AF = int(config.get("annualization_factor", config["n_days"]))
     mu_train_ann_assets    = AF * returns_train.mean(axis=0)
-    sigma_train_ann_assets = np.sqrt(AF) * returns_train.std(axis=0, ddof=1)
+    sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
 
     # exact constraint metric (matches solver): ||L w||_2 with L^T L ≈ Σ_ann
     L = psd_cholesky(Sigma_ann, config["epsilon_sigma"])
-    risk_train_ann = float(np.linalg.norm(L @ w))
+    risk_train_ann = float(xp.linalg.norm(L @ w))
     tol = max(atol, rtol * max(rho, risk_train_ann))
     ok_train = bool(risk_train_ann <= rho + tol)
 
@@ -773,10 +835,10 @@ def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sig
     mu_eval_ann_assets = AF * returns_eval.mean(axis=0)
     ret_eval_ann = float(mu_eval_ann_assets @ w)
 
-    gross_exposure = float(np.sum(np.abs(w)))
-    top_idx = np.argsort(w)[-3:][::-1]
-    nz = np.where(w != 0)[0]
-    bot_idx = nz[np.argsort(w[nz])[:3]] if nz.size else np.array([], dtype=int)
+    gross_exposure = float(xp.sum(xp.abs(w)))
+    top_idx = xp.argsort(w)[-3:][::-1]
+    nz = xp.where(w != 0)[0]
+    bot_idx = nz[xp.argsort(w[nz])[:3]] if nz.size else xp.array([], dtype=int)
 
     print("\n" + "=" * 50)
     print(label)
@@ -820,7 +882,7 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
                                 (config or {}).get("n_days", n_days)))
 
     # concatenated series for realized stats (like multi-trial)
-    port_train = np.zeros(n_days); port_eval = np.zeros(n_days)
+    port_train = xp.zeros(n_days); port_eval = xp.zeros(n_days)
     for k, w in enumerate(w_list):
         a, b = segs[k], segs[k+1]
         port_train[a:b] = returns_train[a:b] @ w
@@ -835,7 +897,7 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
 
     # Asset-level sample stats (arith. daily → annualized with AF)
     mu_train_ann_assets    = AF * returns_train.mean(axis=0)
-    sigma_train_ann_assets = np.sqrt(AF) * returns_train.std(axis=0, ddof=1)
+    sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
 
     print("\n" + "=" * 50)
     print(label)
@@ -876,13 +938,13 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
         else:
             mu_seg_ann = mu_train_ann_assets
         if (b - a) > 1:
-            sig_seg_ann = np.sqrt(AF) * returns_train[a:b].std(axis=0, ddof=1)
+            sig_seg_ann = xp.sqrt(AF) * returns_train[a:b].std(axis=0, ddof=1)
         else:
             sig_seg_ann = sigma_train_ann_assets
 
-        top_idx = np.argsort(w)[-3:][::-1]
-        nz = np.where(w != 0)[0]
-        bot_idx = nz[np.argsort(w[nz])[:3]] if nz.size else np.array([], dtype=int)
+        top_idx = xp.argsort(w)[-3:][::-1]
+        nz = xp.where(w != 0)[0]
+        bot_idx = nz[xp.argsort(w[nz])[:3]] if nz.size else xp.array([], dtype=int)
 
         print(f"\nPiece {k+1}  days [{a},{b}):")
         print("Top 3 assets with largest weights:")
@@ -905,9 +967,8 @@ def _avg_holding_period_from_marks(rebal_marks):
     return float(max(r) / (len(r) - 1))
 
 def _fmt4(a):
-    import numpy as _np
-    return _np.array2string(
-        _np.asarray(a, float),
+    return xp.array2string(
+        xp.asarray(a, float),
         separator=' ',
         formatter={'float_kind': lambda x: f"{x:.4f}"})
 
@@ -949,7 +1010,7 @@ def import_data(filename):
 def _num_series(s):
     return pd.to_numeric(s, errors="coerce").astype("float64")
 
-def map_labels_to_calendar(z_ser: pd.Series, cal: pd.DatetimeIndex) -> np.ndarray:
+def map_labels_to_calendar(z_ser: pd.Series, cal: pd.DatetimeIndex) -> xp.ndarray:
     """
     Map labels only on exact matching dates in `cal`.
     No forward/back fill. Missing elsewhere.
@@ -957,33 +1018,36 @@ def map_labels_to_calendar(z_ser: pd.Series, cal: pd.DatetimeIndex) -> np.ndarra
     z = pd.Series(z_ser).sort_index()
     z.index = pd.to_datetime(z.index)
     cal = pd.DatetimeIndex(cal)
-    out = pd.Series(np.nan, index=cal)
+    out = pd.Series(xp.nan, index=cal)
     inter = cal.intersection(z.index)
     if len(inter):
         out.loc[inter] = z.reindex(inter).to_numpy()
     return out.to_numpy(dtype=float)
 
-def build_calendar_union_px(tickers, px_all, start_dt, end_dt):
+def build_calendar_union_px(securities, px_all, start_dt, end_dt):
     """UNION of PX return dates over [start_dt,end_dt]."""
+    import numpy as _np
     cal = None
-    for t in tickers:
+    for t in securities:
         px_ser = _num_series(px_all[t].loc[start_dt:end_dt]).dropna()
-        idx = np.log(px_ser).diff().dropna().index  # dates where return exists
+        idx = _np.log(px_ser).diff().dropna().index # dates where return exists
         cal = idx if cal is None else cal.union(idx)
     if cal is None or len(cal) == 0:
         raise RuntimeError("Empty calendar after applying start/end.")
     return pd.DatetimeIndex(cal)
 
 def make_data_from_returns_panel(R: pd.DataFrame, ann_factor=252):
-    R = pd.DataFrame(R).astype(np.float64)
-    X = np.ascontiguousarray(R.to_numpy(np.float64, copy=False))
+    import numpy as _np
+    R = pd.DataFrame(R).astype(_np.float64)
+    X_np = R.to_numpy(_np.float64, copy=False)
+    X = xp.asarray(X_np)                   # move to GPU once
     T, N = X.shape
-    logR  = np.log1p(X)
+    logR = xp.log1p(X)
     mu_d  = logR.mean(axis=0)
-    Sig_d = np.cov(logR.T, ddof=1)
+    Sig_d = xp.cov(logR.T, ddof=1)
     return {
         "train": X, "test": X, "n_days": T, "ann_factor": ann_factor,
-        "mu_ann_full": np.expm1(mu_d * ann_factor), "Sigma_ann_full": Sig_d * ann_factor,
+        "mu_ann_full": xp.expm1(mu_d * ann_factor), "Sigma_ann_full": Sig_d * ann_factor,
         "px_cols": R.columns.tolist(), "index": R.index}
 
 def pooled_moments_by_regime(R_df, Z_labels, t_idx, ann=252, min_pair=60, mode="pairwise"):
@@ -994,7 +1058,7 @@ def pooled_moments_by_regime(R_df, Z_labels, t_idx, ann=252, min_pair=60, mode="
     intersected with availability (non-NaN returns). Pairwise covariance uses pairwise overlaps.
     """
     names = list(R_df.columns); N = len(names)
-    L = np.log1p(R_df.values)  # (T, N), may have NaNs
+    L = xp.log1p(xp.asarray(R_df.values)) # (T, N), may have NaNs
     T = L.shape[0]
     t_idx = int(min(max(0, t_idx), T-1))
 
@@ -1002,121 +1066,137 @@ def pooled_moments_by_regime(R_df, Z_labels, t_idx, ann=252, min_pair=60, mode="
     s = []
     valid_asset = []
     for n in names:
-        z = np.asarray(Z_labels[n], float)  # may contain NaN
+        z = xp.asarray(Z_labels[n], float)  # may contain NaN
         if z.shape[0] != T:
             raise ValueError("Z_labels arrays must have length T after mapping to calendar.")
-        if np.isfinite(z[t_idx]):
+        if xp.isfinite(z[t_idx]):
             s.append(int(z[t_idx]))
             valid_asset.append(True)
         else:
-            s.append(np.nan)
+            s.append(xp.nan)
             valid_asset.append(False)
 
     # filter to assets that have a valid label at t_idx
     keep = [i for i, ok in enumerate(valid_asset) if ok]
     if not keep:
         # no assets valid at this time -> return zeros of right shape
-        mu_ann = np.zeros(N)
-        Sig_ann = np.zeros((N, N))
+        mu_ann = xp.zeros(N)
+        Sig_ann = xp.zeros((N, N))
         return mu_ann, Sig_ann
 
     # compute masks and moments
-    mu_d = np.zeros(N); var_d = np.zeros(N)
+    mu_d = xp.zeros(N); var_d = xp.zeros(N)
     S_sets = [None]*N
 
     for i, n in enumerate(names):
         if not valid_asset[i]:
-            mu_d[i] = 0.0; var_d[i] = 0.0; S_sets[i] = np.array([], dtype=int); continue
-        zi = np.asarray(Z_labels[n], float)
+            mu_d[i] = 0.0; var_d[i] = 0.0; S_sets[i] = xp.array([], dtype=int); continue
+        zi = xp.asarray(Z_labels[n], float)
         # indices where label equals current state and return is available
-        S_i = np.where((zi == s[i]) & np.isfinite(L[:, i]))[0]
+        S_i = xp.where((zi == s[i]) & xp.isfinite(L[:, i]))[0]
         S_sets[i] = S_i
         li = L[S_i, i]
-        mu_d[i]  = float(np.nanmean(li)) if li.size else 0.0
-        var_d[i] = float(np.nanvar(li, ddof=1)) if li.size > 1 else 0.0
+        mu_d[i]  = float(xp.nanmean(li)) if li.size else 0.0
+        var_d[i] = float(xp.nanvar(li, ddof=1)) if li.size > 1 else 0.0
 
-    Sig_d = np.zeros((N, N))
+    Sig_d = xp.zeros((N, N))
     if mode == "diag":
-        np.fill_diagonal(Sig_d, var_d)
+        xp.fill_diagonal(Sig_d, var_d)
     else:
-        min_pairs = np.inf
+        min_pairs = xp.inf
         for i in range(N):
             for j in range(i, N):
                 if not (valid_asset[i] and valid_asset[j]):
                     cij = 0.0 if i != j else var_d[i]
                 else:
-                    S_ij = np.intersect1d(S_sets[i], S_sets[j], assume_unique=False)
+                    S_ij = xp.intersect1d(S_sets[i], S_sets[j], assume_unique=False)
                     # drop rows where either return is NaN (already filtered in S_i by column-wise)
                     if S_ij.size >= 2:
-                        cij = np.cov(L[S_ij, i], L[S_ij, j], ddof=1)[0, 1]
+                        cij = xp.cov(L[S_ij, i], L[S_ij, j], ddof=1)[0, 1]
                     else:
                         cij = 0.0 if i != j else var_d[i]
-                    min_pairs = min(min_pairs, S_ij.size if S_ij.size else np.inf)
+                    min_pairs = min(min_pairs, S_ij.size if S_ij.size else xp.inf)
                 Sig_d[i, j] = Sig_d[j, i] = float(cij)
         # shrink if pairwise sample is thin
-        if not np.isinf(min_pairs):
+        if not xp.isinf(min_pairs):
             lam = float(min(1.0, (min_pair / max(int(min_pairs), 1))))
-            Sig_d = (1 - lam) * Sig_d + lam * np.diag(np.diag(Sig_d))
+            Sig_d = (1 - lam) * Sig_d + lam * xp.diag(xp.diag(Sig_d))
 
-    mu_ann  = np.expm1(ann * mu_d)
+    mu_ann  = xp.expm1(ann * mu_d)
     Sig_ann = ann * Sig_d
     return mu_ann, Sig_ann
 
 def _select_best_config(results_df, security, prefer_configs=None):
     """
-    Pick the best config for `security` from results_df ONLY.
-    Priority: lowest rank (if present), then highest score.
-    Robust to string/number dtype quirks in CSV.
+    For a given `security`:
+      (a) if `prefer_configs` provided → restrict to those config NAMES
+          (accept list of strings or list of dicts with 'config');
+      (b) else → use ALL rows for that security.
+    Then select by: score ↓, n_regimes ↑, dim_latent ↑ (sum if vector).
+    Return the chosen `config` string (or None).
     """
-    import pandas as pd
-    sec = str(security).strip()
+    import numpy as np, pandas as pd, ast, re
 
     if results_df is None or len(results_df) == 0:
         return None
-
-    # Normalize types
-    df = results_df.copy()
-    if "security" not in df.columns or "config" not in df.columns:
+    if "security" not in results_df.columns or "config" not in results_df.columns:
         return None
 
+    df = results_df.copy()
     df["security"] = df["security"].astype(str).str.strip()
+    df["config"]   = df["config"].astype(str).str.strip()
+
+    # filter by security
+    sec = str(security).strip()
     df = df[df["security"] == sec]
     if df.empty:
         return None
 
-    # Optional filter by preferred configs
-    df["config"] = df["config"].astype(str).str.strip()
+    # (a) restrict to prefer_configs (by NAME) if provided
     if prefer_configs:
-        pref = df["config"].isin([str(x).strip() for x in prefer_configs])
-        df = df[pref] if pref.any() else df
+        names = []
+        for x in prefer_configs:
+            if isinstance(x, dict) and "config" in x:
+                names.append(str(x["config"]).strip())
+            else:
+                names.append(str(x).strip())
+        mask = df["config"].isin(names)
+        df = df[mask]
         if df.empty:
-            return None
+            return None  # nothing matches preferences
 
-    # Coerce numeric for correct sorting
-    if "rank" in df.columns:
-        df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-    if "score" in df.columns:
-        df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    # helpers to extract K and dim
+    to_num = lambda x: pd.to_numeric(x, errors="coerce")
 
-    # Sort: rank asc (NaN last), then score desc (NaN last)
-    has_rank = "rank" in df.columns
-    has_score = "score" in df.columns
+    def parse_K(row):
+        for kcol in ("n_regimes","K","k","nStates","n_states"):
+            if kcol in row and pd.notna(row[kcol]):
+                return to_num(row[kcol])
+        m = re.search(r"[Kk]\s*=?\s*(\d+)", str(row.get("config","")))
+        return float(m.group(1)) if m else xp.nan
 
-    if has_rank and has_score:
-        df = df.sort_values(["rank", "score"],
-                            ascending=[True, False],
-                            na_position="last")
-    elif has_score:
-        df = df.sort_values(["score"], ascending=False, na_position="last")
-    elif has_rank:
-        df = df.sort_values(["rank"], ascending=True, na_position="last")
-    else:
-        # no rank/score columns—keep first available row
-        pass
+    def dim_metric(row):
+        v = row.get("dim_latent", xp.nan)
+        if isinstance(v, str):
+            try: v = ast.literal_eval(v)
+            except Exception: pass
+        if isinstance(v, (list, tuple)):
+            s = pd.to_numeric(pd.Series(v), errors="coerce").dropna()
+            return float(s.sum()) if len(s) else xp.nan
+        return float(to_num(v))
 
-    if df.empty:
+    df["score_num"] = to_num(df.get("score", xp.nan))
+    df["K_num"]     = [parse_K(r)    for _, r in df.iterrows()]
+    df["D_num"]     = [dim_metric(r) for _, r in df.iterrows()]
+
+    df = df.sort_values(["score_num","K_num","D_num"],
+                        ascending=[False, True, True],
+                        na_position="last")
+
+    if df.empty or pd.isna(df.iloc[0]["score_num"]):
         return None
     return str(df.iloc[0]["config"])
+
 
 def _labels_from_segments_df(segments_df, security, config):
     df = segments_df[(segments_df["security"] == security) &
@@ -1136,63 +1216,96 @@ def _labels_from_segments_df(segments_df, security, config):
 # Pipeline
 # -------------------------
 
-def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True):
-    
-    import numpy as np, pandas as pd, hashlib, os
+def dro_pipeline(securities, CONFIG, verbose=True):
 
-    def _resolve_rSLDS_outputs(RSLDS_CONFIG):
-        res_csv  = RSLDS_CONFIG["results_csv"]
-        seg_parq = RSLDS_CONFIG["segments_parquet"]
+    def _resolve_rSLDS_outputs(CONFIG):
+        res_csv  = CONFIG["results_csv"]
+        seg_parq = CONFIG["segments_parquet"]
         return res_csv, seg_parq
 
-    # 0) Panels
-    px_all, eps_all, pe_all, ser_vix = import_data(RSLDS_CONFIG["data_excel"])
+    # --- artifacts first: derive/validate `securities` from gridsearch results ---
+    res_csv, seg_parq = _resolve_rSLDS_outputs(CONFIG)
+    if not os.path.exists(res_csv):
+        raise FileNotFoundError(f"Results CSV not found: {res_csv}")
+    if not os.path.exists(seg_parq):
+        raise FileNotFoundError(f"Segments Parquet not found: {seg_parq}")
+
+    # read minimal columns from results
+    df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")
+    if "security" not in df_res.columns:
+        raise ValueError("results_csv missing 'security' column")
+    df_res["security"] = df_res["security"].astype(str).str.strip()
+
+    # build or check securities
+    if securities is None:
+        securities = sorted(df_res["security"].unique())
+    else:
+        req  = set(map(str, securities))
+        have = set(df_res["security"].unique())
+        missing = sorted(req - have)
+        assert not missing, (
+            f"[gridsearch check] Missing {len(missing)} in results CSV: " + ", ".join(missing)
+        )
+
+    # also ensure presence in segments parquet
+    df_seg_header = pd.read_parquet(seg_parq, columns=["security"])  # light read
+    if "security" not in df_seg_header.columns:
+        raise ValueError("segments_parquet missing 'security' column")
+    have_seg = set(df_seg_header["security"].astype(str).str.strip().unique())
+    missing_seg = sorted(set(securities) - have_seg)
+    assert not missing_seg, (
+        f"[segments check] Missing {len(missing_seg)} in segments parquet: " + ", ".join(missing_seg)
+    )
+
+    # --- Panels (now that `securities` is known/validated) ---
+    px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])
+
     # ensure every ticker exists in px_all; warn+drop otherwise
     px_names = set(map(str, px_all.columns))
-    keep_px = [t for t in tickers if t in px_names]
-    dropped_px = [t for t in tickers if t not in px_names]
+    keep_px = [t for t in securities if t in px_names]
+    dropped_px = [t for t in securities if t not in px_names]
     if dropped_px:
-        print("[WARN] Dropping tickers not found in PX panel:", ", ".join(sorted(dropped_px)))
-    tickers = keep_px
-    if not tickers:
-        raise RuntimeError("No tickers left after intersecting with PX panel.")
+        print("[WARN] Dropping securities not found in PX panel:", ", ".join(sorted(dropped_px)))
+    securities = keep_px
+    if not securities:
+        raise RuntimeError("No securities left after intersecting with PX panel.")
 
-    # 1) RETURNS calendar (UNION; PX-only; honours start/end)
+    # RETURNS calendar (UNION; PX-only; honours start/end)
     GIDX = build_calendar_union_px(
-        tickers, px_all, DRO_CONFIG["start_dt"], DRO_CONFIG["end_dt"])
+        securities, px_all, CONFIG["start_dt"], CONFIG["end_dt"])
 
-    # 2) Returns panel — IDENTICAL construction for both modes
+    # Returns panel — IDENTICAL construction for both modes
     R_cols = []
-    for t in tickers:
-        px = _num_series(px_all[t].loc[DRO_CONFIG["start_dt"]:DRO_CONFIG["end_dt"]]).dropna()
+    for t in securities:
+        px = _num_series(px_all[t].loc[CONFIG["start_dt"]:CONFIG["end_dt"]]).dropna()
         r  = px.pct_change()                 # native calendar returns
         R_cols.append(r.reindex(GIDX))       # align to union; keep NaN where absent
     R_use    = pd.concat(R_cols, axis=1)
-    R_use.columns = list(tickers)
+    R_use.columns = list(securities)
     R_df_all = R_use.copy()
 
     # Part A on intersection only (OK to drop NaN here because Part A is "static common")
     R_use_clean = R_use.dropna(how="any")
     dataA = make_data_from_returns_panel(R_use_clean)
 
-    # 3) Part A: static DRO (on common intersection)
+    # Part A: static DRO (on common intersection)
     N = dataA["train"].shape[1]
-    paramsA = dict(DELTA_DEFAULTS[DRO_CONFIG["delta_name"]])
-    fitA = fit_dro(dataA, paramsA, DRO_CONFIG["GLOBAL"])
+    paramsA = dict(DELTA_DEFAULTS[CONFIG["delta_name"]])
+    fitA = fit_dro(dataA, paramsA, CONFIG["GLOBAL"])
     assert len(fitA["w"]) == N, f"len(w)={len(fitA['w'])} != N={N} from DATA_A"
-    summA = evaluate_portfolio(fitA, dataA, DRO_CONFIG["GLOBAL"]) # pass the full fit so delta, kappa are recorded
+    summA = evaluate_portfolio(fitA, dataA, CONFIG["GLOBAL"]) # pass the full fit so delta, kappa are recorded
 
     # Part A daily portfolio returns (on intersection calendar)
     partA_daily = pd.Series(
-        dataA["train"] @ np.asarray(fitA["w"]).reshape(-1),
+        dataA["train"] @ xp.asarray(fitA["w"]).reshape(-1),
         index=dataA["index"], name="PartA_daily")
     
-    # 4) rSLDS labels (CSV affects model selection; Parquet supplies segments)
+    # rSLDS labels (CSV affects model selection; Parquet supplies segments)
     Z_labels = {}
     
     # Reuse artifacts: CSV (results) + Parquet (segments)
     import os
-    res_csv, seg_parq = _resolve_rSLDS_outputs(RSLDS_CONFIG)
+    res_csv, seg_parq = _resolve_rSLDS_outputs(CONFIG)
 
     if not os.path.exists(res_csv):
         raise FileNotFoundError(f"Results CSV not found: {res_csv}")
@@ -1203,6 +1316,14 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
     df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")  # tolerant parser
     cols   = ["security", "config", "rank", "score"]
     df_res = df_res[[c for c in cols if c in df_res.columns]].copy()
+
+    if securities is not None:
+        req  = set(map(str, securities))
+        have = set(df_res["security"].astype(str).str.strip().unique())
+        missing = sorted(req - have)
+        assert not missing, (
+            f"[gridsearch check] Missing {len(missing)} in results CSV: " + ", ".join(missing))
+    
     df_seg = pd.read_parquet(seg_parq)
 
     # Optional: normalize dtypes (helps sorting/selection later)
@@ -1219,20 +1340,20 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
     if df_seg["date"].dtype != "datetime64[ns]":
         df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
 
-    # Non-strict: keep only tickers present in BOTH artifacts; warn for the rest
+    # Non-strict: keep only securities present in BOTH artifacts; warn for the rest
     res_names = set(df_res["security"].astype(str).unique())
     seg_names = set(df_seg["security"].astype(str).unique())
-    keep = [s for s in tickers if (s in res_names and s in seg_names)]
-    dropped = [s for s in tickers if s not in keep]
+    keep = [s for s in securities if (s in res_names and s in seg_names)]
+    dropped = [s for s in securities if s not in keep]
     if dropped:
-        print("[WARN] Dropping tickers not present in both artifacts:", ", ".join(sorted(dropped)))
-    tickers = keep
-    if not tickers:
-        raise RuntimeError("No overlapping tickers between requested list and artifacts.")
+        print("[WARN] Dropping securities not present in both artifacts:", ", ".join(sorted(dropped)))
+    securities = keep
+    if not securities:
+        raise RuntimeError("No overlapping securities between requested list and artifacts.")
 
     # Build Z_labels (use the correct helper)
-    for sec in tickers:
-        cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
+    for sec in securities:
+        cfg_best = _select_best_config(df_res, sec, CONFIG.get("prefer_configs"))
         if cfg_best is None:
             print(f"[WARN] No winning config in results for {sec}; skipping.")
             continue
@@ -1242,27 +1363,27 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
             continue
         Z_labels[sec] = map_labels_to_calendar(z_ser, R_df_all.index)
 
-    missing = [sec for sec in tickers if sec not in Z_labels]
+    missing = [sec for sec in securities if sec not in Z_labels]
     if missing:
         print(f"[WARN] Missing regimes for: {missing}. Dropped from pooled moments.")
-    avail = [sec for sec in tickers if sec in Z_labels]
+    avail = [sec for sec in securities if sec in Z_labels]
     if not avail:
         raise RuntimeError("No assets produced rSLDS labels. Cannot proceed with Part B.")
     
     T = len(R_df_all.index)
     
     for sec in avail:
-        z = np.asarray(Z_labels[sec], float)
+        z = xp.asarray(Z_labels[sec], float)
         assert z.shape[0] == T, f"[{sec}] label length {len(z)} != T={T}"
-        n_nan = int(np.isnan(z).sum())
-        uniq  = sorted(set([int(u) for u in np.unique(z[np.isfinite(z)])])) if np.isfinite(z).any() else []
+        n_nan = int(xp.isnan(z).sum())
+        uniq  = sorted(set([int(u) for u in xp.unique(z[xp.isfinite(z)])])) if xp.isfinite(z).any() else []
         
-    # 5) Per-asset segments + entry indices
+    # Per-asset segments + entry indices
     per_asset_segs_on_cal = {}
     for sec in avail:
-        z_arr = np.asarray(Z_labels[sec], float)  # length T, NaNs allowed
+        z_arr = xp.asarray(Z_labels[sec], float)  # length T, NaNs allowed
         # changepoints on the union calendar (ignore NaN→state and state→NaN edges)
-        finite = np.isfinite(z_arr)
+        finite = xp.isfinite(z_arr)
         cps = []
         for t in range(1, T):
             if finite[t] and finite[t-1] and (z_arr[t] != z_arr[t-1]):
@@ -1279,7 +1400,7 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         print(f"[{sec}] raw segments: {per_asset_segs_on_cal[sec]}")
     print("\n[UNION] segments:", global_segs)
 
-    # 6) Regime-DRO solves (time-varying universe; no coarsen)
+    # Regime-DRO solves (time-varying universe; no coarsen)
     names_all = list(avail)
     taus = list(global_segs)
     w_list = []
@@ -1290,43 +1411,43 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         # active assets at t_mid: entered and finite label
         A_k = []
         for n in names_all:
-            z = np.asarray(Z_labels[n], float)
+            z = xp.asarray(Z_labels[n], float)
             r = R_df_all[n].to_numpy(dtype=float, copy=False)
-            if np.isfinite(z[t_mid]) and np.isfinite(r[t_mid]):
+            if xp.isfinite(z[t_mid]) and xp.isfinite(r[t_mid]):
                 A_k.append(n)
         
         print(f"[t={t_mid} | {R_df_all.index[t_mid].date()}] active: {A_k}")
-        min_assets = int(DRO_CONFIG.get("min_assets", 1))
+        min_assets = int(CONFIG.get("min_assets", 1))
         if len(A_k) < min_assets:
             print(f"[WARN][t={t_mid} | {R_df_all.index[t_mid].date()}] only {len(A_k)} active assets (<{min_assets}).")
         
         if len(A_k) == 0:
-            w_list.append(np.zeros(len(names_all))); continue
+            w_list.append(xp.zeros(len(names_all))); continue
 
         R_df_k = R_df_all[A_k]  # keep NaNs; moments handle masks
         mu_ann, Sig_ann = pooled_moments_by_regime(
             R_df_k, {n: Z_labels[n] for n in A_k}, t_mid,
-            ann=252, min_pair=int(DRO_CONFIG.get("min_seg_len_obs", 20)), mode="pairwise")
+            ann=252, min_pair=int(CONFIG.get("min_seg_len_obs", 20)), mode="pairwise")
 
         data_k = {
             "train": R_df_k.fillna(0.0).to_numpy(dtype=float),  # content unused when using moments override
             "test":  R_df_k.fillna(0.0).to_numpy(dtype=float),
             "n_days": R_df_k.shape[0],
             "ann_factor": 252,
-            "mu_ann_full": np.asarray(mu_ann, float),
-            "Sigma_ann_full": np.asarray(Sig_ann, float),
+            "mu_ann_full": xp.asarray(mu_ann, float),
+            "Sigma_ann_full": xp.asarray(Sig_ann, float),
             "px_cols": list(A_k),
             "index": R_df_k.index
         }
-        paramsR = dict(DELTA_DEFAULTS[DRO_CONFIG["delta_name"]])
+        paramsR = dict(DELTA_DEFAULTS[CONFIG["delta_name"]])
         paramsR["use_moments_override"] = True
 
-        fit_k = fit_dro(data_k, paramsR, DRO_CONFIG["GLOBAL"])
-        w_sub = np.asarray(fit_k["w"]).reshape(-1)
-        delta_k = float(fit_k.get("delta", np.nan))
+        fit_k = fit_dro(data_k, paramsR, CONFIG["GLOBAL"])
+        w_sub = xp.asarray(fit_k["w"]).reshape(-1)
+        delta_k = float(fit_k.get("delta", xp.nan))
         
         # expand to full vector
-        w_full = np.zeros(len(names_all))
+        w_full = xp.zeros(len(names_all))
         pos = {n: i for i, n in enumerate(names_all)}
         for j, n in enumerate(A_k):
             w_full[pos[n]] = w_sub[j]
@@ -1340,8 +1461,8 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
 
     fitB = {
         "type": "piecewise",
-        "w_list": [np.asarray(w, float) for w in w_list],
-        "segs": np.asarray(taus, dtype=np.int64),
+        "w_list": [xp.asarray(w, float) for w in w_list],
+        "segs": xp.asarray(taus, dtype=xp.int64),
         "names": names_all,
         "delta_list": seg_deltas,
     }
@@ -1352,40 +1473,79 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         "test":  R_df_all.fillna(0.0).to_numpy(dtype=float),
         "n_days": T,
         "ann_factor": 252,
-        "mu_ann_full": np.zeros(len(names_all)),
-        "Sigma_ann_full": np.eye(len(names_all)),
+        "mu_ann_full": xp.zeros(len(names_all)),
+        "Sigma_ann_full": xp.eye(len(names_all)),
         "px_cols": names_all,
         "index": R_df_all.index}
     
     # extra dataset digest for Part B eval
     X = R_df_all.fillna(0.0).to_numpy(dtype=float)
-    summB = evaluate_portfolio(fitB, data_eval, DRO_CONFIG["GLOBAL"])
+    summB = evaluate_portfolio(fitB, data_eval, CONFIG["GLOBAL"])
 
     # Part B daily portfolio returns (on union calendar)
     X_union = R_df_all.fillna(0.0).to_numpy(dtype=float)   # same as evaluation
     T = X_union.shape[0]
-    partB = np.zeros(T, dtype=float)
+    partB = xp.zeros(T, dtype=float)
     for (a, b), w_k in zip(zip(fitB["segs"][:-1], fitB["segs"][1:]), fitB["w_list"]):
-        partB[a:b] = X_union[a:b] @ np.asarray(w_k).reshape(-1)
+        partB[a:b] = X_union[a:b] @ xp.asarray(w_k).reshape(-1)
     
     partB_daily = pd.Series(partB, index=R_df_all.index, name="PartB_daily")
+
+    # MVO baseline
+    fit_mvo0  = fit_mvo(dataA, {}, CONFIG["GLOBAL"])
+    summ_mvo0 = evaluate_portfolio(fit_mvo0, dataA, CONFIG["GLOBAL"])
+
+    # MVO daily portfolio returns (on intersection calendar)
+    mvo_daily = pd.Series(
+        dataA["train"] @ xp.asarray(fit_mvo0["w"]).reshape(-1),
+        index=dataA["index"], name="MVO_daily")
     
+    # Print results
     if verbose:
-        print("\n[Part A] Static DRO summary:\n", pd.Series(summA).round(4))
-        print("\n[Part B] Regime-DRO summary:\n", pd.Series(summB).round(4))
-    
+        print("\n[MVO]    MVO baseline summary:\n", pd.Series(summ_mvo0).round(4))
+        print("\n[DRO]    Static DRO summary:\n", pd.Series(summA).round(4))
+        print("\n[RegDRO] Regime-DRO summary:\n", pd.Series(summB).round(4))
+
         # portfolios (weights)
-        print("\n[Part A] weights:\n", _fmt4(fitA["w"]), flush=True)
-        print("\n[Part B] piecewise weights:", flush=True)
+        print("\n[DRO]    weights:\n", _fmt4(fitA["w"]), flush=True)
+        print("\n[RegDRO] piecewise weights:", flush=True)
         for k, w_k in enumerate(fitB["w_list"], 1):
             print(f"  k={k}: {_fmt4(w_k)}", flush=True)
 
     return {
+        "MVO":   {"fit": fit_mvo0, "summary": summ_mvo0},
         "PartA": {"fit": fitA, "data": dataA, "summary": summA},
         "PartB": {"fit": fitB, "summary": summB,
                   "per_asset_segs": per_asset_segs_on_cal, "global_segs": taus,
                   "Z_labels": Z_labels},
-        "returns_union": R_df_all,                  # <-- (optional) full panel for your plotting/diagnostics
-        "series": {"PartA_daily": partA_daily, "PartB_daily": partB_daily},
-        "tickers": avail}
+        "returns_union": R_df_all,
+        "series": {"MVO_daily": mvo_daily, "PartA_daily": partA_daily, "PartB_daily": partB_daily},
+        "securities": avail}
+
+# -------------------------
+# IO
+# -------------------------
+
+def save_out(out: dict, path: str):
+    """
+    Save `out` dict to `path`. Use .pkl or .pkl.gz.
+    """
+    if path.endswith(".gz"):
+        with gzip.open(path, "wb") as f:
+            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(path, "wb") as f:
+            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+def load_out(path: str) -> dict:
+    """
+    Load dict saved by save_out.
+    """
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    else:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
 
