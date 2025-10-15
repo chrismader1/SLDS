@@ -1,10 +1,3 @@
-import numpy as np, hashlib
-import pandas as pd
-import matplotlib.pyplot as plt
-import cvxpy as cp
-from scipy import stats
-from scipy.optimize import linear_sum_assignment
-from gridsearch import *
 
 
 # ---------------------------------------------------------------
@@ -23,7 +16,17 @@ except Exception:
     from scipy import stats as xp_stats
     GPU = False
 
+
+
 print(f"GPU={GPU}")
+
+import hashlib
+import pandas as pd
+import matplotlib.pyplot as plt
+import cvxpy as cp
+from scipy import stats
+from scipy.optimize import linear_sum_assignment
+
 
 
 # ---------------------------------------------------------------
@@ -1142,12 +1145,6 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
         seg_parq = RSLDS_CONFIG["segments_parquet"]
         return res_csv, seg_parq
 
-    # when running gridsearch, ignore provided tickers
-    if DRO_CONFIG.get("run_gridsearch", False):
-        print(f"run_gridsearch=True → using tickers passed in: {tickers}\n")
-    else:
-        print(f"run_gridsearch=False → using tickers in gridsearch_results\n")
-    
     # 0) Panels
     px_all, eps_all, pe_all, ser_vix = import_data(RSLDS_CONFIG["data_excel"])
     # ensure every ticker exists in px_all; warn+drop otherwise
@@ -1193,65 +1190,57 @@ def dro_pipeline(tickers, RSLDS_CONFIG, DRO_CONFIG, DELTA_DEFAULTS, verbose=True
     # 4) rSLDS labels (CSV affects model selection; Parquet supplies segments)
     Z_labels = {}
     
-    if DRO_CONFIG.get("run_gridsearch", False):
-        # Run fresh gridsearch (no file IO for labels)
-        best = pipeline_actual(tickers, RSLDS_CONFIG)
-        for sec in tickers:
-            if sec in best["Z_labels"]:
-                Z_labels[sec] = map_labels_to_calendar(best["Z_labels"][sec], R_df_all.index)
-                
-    else:
-        # Reuse artifacts: CSV (results) + Parquet (segments)
-        import os
-        res_csv, seg_parq = _resolve_rSLDS_outputs(RSLDS_CONFIG)
+    # Reuse artifacts: CSV (results) + Parquet (segments)
+    import os
+    res_csv, seg_parq = _resolve_rSLDS_outputs(RSLDS_CONFIG)
 
-        if not os.path.exists(res_csv):
-            raise FileNotFoundError(f"Results CSV not found: {res_csv}")
-        if not os.path.exists(seg_parq):
-            raise FileNotFoundError(f"Segments Parquet not found: {seg_parq}")
+    if not os.path.exists(res_csv):
+        raise FileNotFoundError(f"Results CSV not found: {res_csv}")
+    if not os.path.exists(seg_parq):
+        raise FileNotFoundError(f"Segments Parquet not found: {seg_parq}")
 
-        # read the first 10 columns, then select required cols
-        df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")  # tolerant parser
-        cols   = ["security", "config", "rank", "score"]
-        df_res = df_res[[c for c in cols if c in df_res.columns]].copy()
-        df_seg = pd.read_parquet(seg_parq)
+    # read the first 10 columns, then select required cols
+    df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")  # tolerant parser
+    cols   = ["security", "config", "rank", "score"]
+    df_res = df_res[[c for c in cols if c in df_res.columns]].copy()
+    df_seg = pd.read_parquet(seg_parq)
 
-        # Optional: normalize dtypes (helps sorting/selection later)
-        if "security" in df_res: df_res["security"] = df_res["security"].astype(str).str.strip()
-        if "config"   in df_res: df_res["config"]   = df_res["config"].astype(str).str.strip()
-        if "rank"     in df_res: df_res["rank"]     = pd.to_numeric(df_res["rank"], errors="coerce")
-        if "score"    in df_res: df_res["score"]    = pd.to_numeric(df_res["score"], errors="coerce")
+    # Optional: normalize dtypes (helps sorting/selection later)
+    if "security" in df_res: df_res["security"] = df_res["security"].astype(str).str.strip()
+    if "config"   in df_res: df_res["config"]   = df_res["config"].astype(str).str.strip()
+    if "rank"     in df_res: df_res["rank"]     = pd.to_numeric(df_res["rank"], errors="coerce")
+    if "score"    in df_res: df_res["score"]    = pd.to_numeric(df_res["score"], errors="coerce")
 
-        # schema + date type
-        required_cols = {"security", "config", "date", "z"}
-        missing_cols = required_cols - set(df_seg.columns)
-        if missing_cols:
-            raise ValueError(f"Segments parquet missing required columns: {missing_cols}")
-        if df_seg["date"].dtype != "datetime64[ns]":
-            df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
+    # schema + date type
+    required_cols = {"security", "config", "date", "z"}
+    missing_cols = required_cols - set(df_seg.columns)
+    if missing_cols:
+        raise ValueError(f"Segments parquet missing required columns: {missing_cols}")
+    if df_seg["date"].dtype != "datetime64[ns]":
+        df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
 
-        # Non-strict: keep only tickers present in BOTH artifacts; warn for the rest
-        res_names = set(df_res["security"].astype(str).unique())
-        seg_names = set(df_seg["security"].astype(str).unique())
-        keep = [s for s in tickers if (s in res_names and s in seg_names)]
-        dropped = [s for s in tickers if s not in keep]
-        if dropped:
-            print("[WARN] Dropping tickers not present in both artifacts:", ", ".join(sorted(dropped)))
-        tickers = keep
-        if not tickers:
-            raise RuntimeError("No overlapping tickers between requested list and artifacts.")
+    # Non-strict: keep only tickers present in BOTH artifacts; warn for the rest
+    res_names = set(df_res["security"].astype(str).unique())
+    seg_names = set(df_seg["security"].astype(str).unique())
+    keep = [s for s in tickers if (s in res_names and s in seg_names)]
+    dropped = [s for s in tickers if s not in keep]
+    if dropped:
+        print("[WARN] Dropping tickers not present in both artifacts:", ", ".join(sorted(dropped)))
+    tickers = keep
+    if not tickers:
+        raise RuntimeError("No overlapping tickers between requested list and artifacts.")
 
-        # Build Z_labels (use the correct helper)
-        for sec in tickers:
-            cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
-            if cfg_best is None:
-                print(f"[WARN] No winning config in results for {sec}; skipping.")
-                continue
-            z_ser = _labels_from_segments_df(df_seg, sec, cfg_best)  # <-- correct helper name
-            if z_ser is None:
-                print(f"[WARN] No segments for {sec} under config={cfg_best}; skipping.")
-                continue
-            Z_labels[sec] = map_labels_to_calendar(z_ser, R_df_all.index)
+    # Build Z_labels (use the correct helper)
+    for sec in tickers:
+        cfg_best = _select_best_config(df_res, sec, DRO_CONFIG.get("prefer_configs"))
+        if cfg_best is None:
+            print(f"[WARN] No winning config in results for {sec}; skipping.")
+            continue
+        z_ser = _labels_from_segments_df(df_seg, sec, cfg_best)  # <-- correct helper name
+        if z_ser is None:
+            print(f"[WARN] No segments for {sec} under config={cfg_best}; skipping.")
+            continue
+        Z_labels[sec] = map_labels_to_calendar(z_ser, R_df_all.index)
 
     missing = [sec for sec in tickers if sec not in Z_labels]
     if missing:
