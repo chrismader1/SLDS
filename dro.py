@@ -6,6 +6,12 @@ from scipy import stats
 from scipy.optimize import linear_sum_assignment
 from gridsearch import *
 
+
+# ---------------------------------------------------------------
+# GPU
+# ---------------------------------------------------------------
+
+
 try:
     import cupy as xp
     from cupyx.scipy.optimize import linear_sum_assignment  # GPU Hungarian
@@ -16,6 +22,8 @@ except Exception:
     from scipy.optimize import linear_sum_assignment
     from scipy import stats as xp_stats
     GPU = False
+
+print(f"GPU={GPU}")
 
 
 # ---------------------------------------------------------------
