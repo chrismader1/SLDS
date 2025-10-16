@@ -290,11 +290,17 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     objective   = cp.Maximize(mu @ w - delta * cp.norm(w, 2))
     prob = cp.Problem(objective, constraints)
 
-    if GPU:
-        prob.solve(solver=cp.SCS, gpu=True, verbose=verbose,
+    try:
+        if GPU:
+            prob.solve(solver=cp.SCS, gpu=True, verbose=verbose,
+                       max_iters=20000, eps=1e-5, acceleration_lookback=10)
+        else:
+            prob.solve(solver=cp.MOSEK, verbose=verbose)
+    
+    except Exception:
+        # fallback on CPU SCS if MOSEK not available
+        prob.solve(solver=cp.SCS, verbose=verbose,
                    max_iters=20000, eps=1e-5, acceleration_lookback=10)
-    else:
-        prob.solve(solver=cp.MOSEK, verbose=verbose)
 
     if w.value is None or prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
         return None
@@ -1403,10 +1409,11 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     names_all = list(avail)
     taus = list(global_segs)
     w_list = []
+    seg_deltas = [] 
 
     for k in range(len(taus) - 1):
         t_mid = min(max(taus[k], 0), T - 1)
-
+    
         # active assets at t_mid: entered and finite label
         A_k = []
         for n in names_all:
@@ -1421,13 +1428,16 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             print(f"[WARN][t={t_mid} | {R_df_all.index[t_mid].date()}] only {len(A_k)} active assets (<{min_assets}).")
         
         if len(A_k) == 0:
-            w_list.append(xp.zeros(len(names_all))); continue
-
+            # No active assets this segment: append zero weights AND a placeholder delta
+            w_list.append(xp.zeros(len(names_all)))
+            seg_deltas.append(xp.nan)    # keep alignment with segments
+            continue
+    
         R_df_k = R_df_all[A_k]  # keep NaNs; moments handle masks
         mu_ann, Sig_ann = pooled_moments_by_regime(
             R_df_k, {n: Z_labels[n] for n in A_k}, t_mid,
             ann=252, min_pair=int(CONFIG.get("min_seg_len_obs", 20)), mode="pairwise")
-
+    
         data_k = {
             "train": R_df_k.fillna(0.0).to_numpy(dtype=float),  # content unused when using moments override
             "test":  R_df_k.fillna(0.0).to_numpy(dtype=float),
@@ -1440,7 +1450,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         }
         paramsR = dict(CONFIG["delta_defaults"][CONFIG["delta_name"]])
         paramsR["use_moments_override"] = True
-
+    
         fit_k = fit_dro(data_k, paramsR, CONFIG["GLOBAL"])
         w_sub = xp.asarray(fit_k["w"]).reshape(-1)
         delta_k = float(fit_k.get("delta", xp.nan))
@@ -1451,12 +1461,9 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         for j, n in enumerate(A_k):
             w_full[pos[n]] = w_sub[j]
         w_list.append(w_full)
-        
-        # collect per-segment deltas
-        if "seg_deltas" not in locals():
-            seg_deltas = []
+    
+        # collect per-segment delta (aligned with this segment)
         seg_deltas.append(delta_k)
-
 
     fitB = {
         "type": "piecewise",
