@@ -24,6 +24,33 @@ import os, re, ast
 import pickle, gzip
 from scipy import stats as sp_stats
 
+
+# -------------------------
+# IO
+# -------------------------
+
+def save_out(out: dict, path: str):
+    """
+    Save `out` dict to `path`. Use .pkl or .pkl.gz.
+    """
+    if path.endswith(".gz"):
+        with gzip.open(path, "wb") as f:
+            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(path, "wb") as f:
+            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+def load_out(path: str) -> dict:
+    """
+    Load dict saved by save_out.
+    """
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    else:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
 # ---------------------------------------------------------------
 # Wasserstein helper functions
 # ---------------------------------------------------------------
@@ -1518,6 +1545,9 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         for k, w_k in enumerate(fitB["w_list"], 1):
             print(f"  k={k}: {_fmt4(w_k)}", flush=True)
 
+    # Save results
+    save_out(out, CONFIG["dro_pickle"])
+    
     return {
         "MVO":   {"fit": fit_mvo0, "summary": summ_mvo0},
         "PartA": {"fit": fitA, "data": dataA, "summary": summA},
@@ -1527,31 +1557,3 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         "returns_union": R_df_all,
         "series": {"MVO_daily": mvo_daily, "PartA_daily": partA_daily, "PartB_daily": partB_daily},
         "securities": avail}
-
-# -------------------------
-# IO
-# -------------------------
-
-def save_out(out: dict, path: str):
-    """
-    Save `out` dict to `path`. Use .pkl or .pkl.gz.
-    """
-    if path.endswith(".gz"):
-        with gzip.open(path, "wb") as f:
-            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        with open(path, "wb") as f:
-            pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-def load_out(path: str) -> dict:
-    """
-    Load dict saved by save_out.
-    """
-    if path.endswith(".gz"):
-        with gzip.open(path, "rb") as f:
-            return pickle.load(f)
-    else:
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-
