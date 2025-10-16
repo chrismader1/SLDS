@@ -25,8 +25,22 @@ import pickle, gzip
 from scipy import stats as sp_stats
 
 # checks
-print("cvxpy:", cvx.__version__, "| clarabel available?", "CLARABEL" in cvx.installed_solvers())
+print("cvxpy:", cp.__version__, "| clarabel available?", "CLARABEL" in cp.installed_solvers())
 print()
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*ECOS will no longer be installed by default.*",
+    category=FutureWarning,
+    module="cvxpy.reductions.solvers.solving_chain",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*Solution may be inaccurate.*",
+    category=UserWarning,
+    module="cvxpy.problems.problem",
+)
 
 # -------------------------
 # IO
@@ -432,39 +446,42 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     objective   = cp.Minimize(delta * cp.norm(w, 2) - mu @ w)
     prob = cp.Problem(objective, constraints)
     
-    # -------- Clarabel (primary) --------
-    # Clarabel’s CVXPY wrapper DOES NOT accept 'max_iters' — use 'max_iter' if you set one.
-    # Start with no extra settings (most robust). Then a second pass with mild settings if needed.
+    # -------- Clarabel primary, SCS fallback --------
     try:
+        # First pass: Clarabel with defaults (most compatible across versions)
         prob.solve(solver=cp.CLARABEL, verbose=verbose)
-        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-            # one more Clarabel attempt with mild settings (valid kw names!)
+    
+        # If needed, second pass with mild tolerances (Clarabel uses 'max_iter', not 'max_iters')
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or (w.value is None):
             prob.solve(
                 solver=cp.CLARABEL,
-                verbose=True if verbose else False,
-                max_iter=10000,            # <-- correct key (no 's')
+                verbose=verbose,
+                max_iter=10000,
                 tol_gap_abs=1e-8,
                 tol_gap_rel=1e-8,
-                tol_feas=1e-8,)
-            
+                tol_feas=1e-8,
+            )
     except Exception as e:
         if verbose:
             print("Clarabel failed:", e)
     
-    # If Clarabel didn’t deliver, use ECOS as a *backup* (still no SCS).
+    # Fallback: SCS (robust for SOCP), tuned for accuracy
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         prob.solve(
-            solver=cp.ECOS,
+            solver=cp.SCS,
             verbose=verbose,
-            max_iters=10000,
-            warm_start=True,
-            abstol=1e-8, reltol=1e-8, feastol=1e-8,
-            abstol_inacc=1e-7, reltol_inacc=1e-7, feastol_inacc=1e-7,)
+            max_iters=40000,
+            eps=1e-5,
+            acceleration_lookback=20,
+            scale=0.8,
+        )
     
+    # Final guard
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
-        raise RuntimeError(f"Solve failed with status={prob.status}")
+        raise RuntimeError(f"Solve failed (Clarabel→SCS), status={prob.status}")
     
     return xp.asarray(w.value).reshape(-1)
+
 
 # ---------------------------------------------------------------
 # Fitting

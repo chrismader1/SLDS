@@ -218,3 +218,4 @@ Data/
 *.parquet
 *.feather
 .DS_Store
+/Output
