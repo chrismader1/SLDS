@@ -1290,7 +1290,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
 
     # Part A: static DRO (on common intersection)
     N = dataA["train"].shape[1]
-    paramsA = dict(DELTA_DEFAULTS[CONFIG["delta_name"]])
+    paramsA = dict(CONFIG["delta_defaults"][CONFIG["delta_name"]])
     fitA = fit_dro(dataA, paramsA, CONFIG["GLOBAL"])
     assert len(fitA["w"]) == N, f"len(w)={len(fitA['w'])} != N={N} from DATA_A"
     summA = evaluate_portfolio(fitA, dataA, CONFIG["GLOBAL"]) # pass the full fit so delta, kappa are recorded
@@ -1304,7 +1304,6 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     Z_labels = {}
     
     # Reuse artifacts: CSV (results) + Parquet (segments)
-    import os
     res_csv, seg_parq = _resolve_rSLDS_outputs(CONFIG)
 
     if not os.path.exists(res_csv):
@@ -1439,7 +1438,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             "px_cols": list(A_k),
             "index": R_df_k.index
         }
-        paramsR = dict(DELTA_DEFAULTS[CONFIG["delta_name"]])
+        paramsR = dict(CONFIG["delta_defaults"][CONFIG["delta_name"]])
         paramsR["use_moments_override"] = True
 
         fit_k = fit_dro(data_k, paramsR, CONFIG["GLOBAL"])
