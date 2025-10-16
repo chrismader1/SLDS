@@ -24,6 +24,9 @@ import os, re, ast
 import pickle, gzip
 from scipy import stats as sp_stats
 
+# checks
+print("cvxpy:", cvx.__version__, "| clarabel available?", "CLARABEL" in cvx.installed_solvers())
+print()
 
 # -------------------------
 # IO
@@ -51,6 +54,7 @@ def load_out(path: str) -> dict:
         with open(path, "rb") as f:
             return pickle.load(f)
 
+
 # ---------------------------------------------------------------
 # Wasserstein helper functions
 # ---------------------------------------------------------------
@@ -77,6 +81,12 @@ def w2_empirical_uniform_exact(X, Y):
     assert d == d2, "X and Y must have the same dimension"
     assert n == m,  "Uniform empirical W2 requires equal sample sizes"
     # cost matrix C_{ij} = ||x_i - y_j||^2
+    # C = ((X[:, None, :] - Y[None, :, :])**2).sum(axis=2)
+    # r, c = linear_sum_assignment(C)
+    # NOTE: exact Hungarian is cubic; keep for small n only
+    if n > 4096:
+        # fall back to sliced-W2 for safety on large n
+        return float(sliced_w2_empirical(X, Y, n_proj=128, rng=None))
     C = ((X[:, None, :] - Y[None, :, :])**2).sum(axis=2)
     r, c = linear_sum_assignment(C)
     return float(xp.sqrt(C[r, c].mean()).item())
@@ -95,46 +105,24 @@ def wasserstein2_gaussian(mu1, Sigma1, mu2, Sigma2, eps=1e-12):
     w2_sq = max(dmu2 + trpart, 0.0)
     return float(xp.sqrt(w2_sq))
 
-    
-def sliced_w2_empirical_OLD(X, Y, n_proj=64, rng=None):
-    """
-    Approximate multivariate W2 by averaging 1D W2 across random directions.
-    X, Y: (n,d) samples with same n preferred (bootstrap uses same n).
-    Returns W2 (not squared).
-    """
-    rng = _rng_from_params({}) if rng is None else rng
-    X = xp.asarray(X); Y = xp.asarray(Y)
-    n, d = X.shape
-    assert Y.shape[1] == d
-    m = Y.shape[0]
-    w2_sq = 0.0
-    for _ in range(int(n_proj)):
-        u = rng.normal(size=d); u /= max(xp.linalg.norm(u), 1e-12)
-        x = xp.sort(X @ u)
-        y = xp.sort(Y @ u)
-        if m != n:
-            # match quantiles if sizes differ
-            q = xp.linspace(0, 1, min(n, m), endpoint=True)
-            xq = xp.quantile(x, q); yq = xp.quantile(y, q)
-            diff = xq - yq
-        else:
-            diff = x - y
-        w2_sq += float(xp.mean(diff*diff))
-    w2_sq /= float(n_proj)
-    return float(xp.sqrt(max(w2_sq, 0.0)))
-
 def sliced_w2_empirical(X, Y, n_proj=256, rng=None):
     """
     Approximate multivariate W2 by averaging 1D W2 across random directions.
     X, Y: (n,d) samples with same n preferred (bootstrap uses same n).
     Returns W2 (not squared).
     """
-    rng = _rng_from_params({}) if rng is None else rng
-    X = xp.asarray(X); Y = xp.asarray(Y)
+    # keep inputs on device, prefer float32 to cut bandwidth
+    X = xp.asarray(X, dtype=xp.float32)
+    Y = xp.asarray(Y, dtype=xp.float32)
     n, d = X.shape; m = Y.shape[0]
 
-    U = rng.normal(size=(n_proj, d))
-    U = xp.asarray(U)
+    # generate directions directly on device when rng is None
+    if (rng is None) and hasattr(xp.random, "standard_normal"):
+        U = xp.random.standard_normal((n_proj, d), dtype=X.dtype)
+    else:
+        rng = _rng_from_params({}) if rng is None else rng
+        U = xp.asarray(rng.normal(size=(n_proj, d)), dtype=X.dtype)
+
     U = U / xp.maximum(xp.linalg.norm(U, axis=1, keepdims=True), 1e-12)
 
     XU = X @ U.T         # (n, P)
@@ -143,12 +131,18 @@ def sliced_w2_empirical(X, Y, n_proj=256, rng=None):
     YU = xp.sort(YU, axis=0)
 
     if m != n:
-        q = xp.linspace(0, 1, min(n, m))
-        XU = xp.quantile(XU, q, axis=0)
-        YU = xp.quantile(YU, q, axis=0)
+        k = int(min(n, m))
+        if k <= 1:
+            # fall back to mean difference on a single quantile (avoids empty/NaN)
+            XU = xp.mean(XU, axis=0, keepdims=True)
+            YU = xp.mean(YU, axis=0, keepdims=True)
+        else:
+            q = xp.linspace(0, 1, k)
+            XU = xp.quantile(XU, q, axis=0)
+            YU = xp.quantile(YU, q, axis=0)
 
     diff = XU - YU
-    w2_sq = xp.mean(diff*diff)
+    w2_sq = xp.mean(diff * diff)
     return float(xp.sqrt(xp.maximum(w2_sq, 0.0)).item())
 
 def _mvnrnd_psd(mu, Sigma, n, rng, eps=1e-9):
@@ -173,7 +167,6 @@ def _cov_batched(Xb: "xp.ndarray[B,n,d]"):
     # enforce symmetry (numerical)
     Sb  = 0.5 * (Sb + xp.transpose(Sb, (0, 2, 1)))
     return mub, Sb
-
 
 def bootstrap_gaussian_delta(R, alpha=0.05, B=512, eps=1e-9, rng=None):
     """
@@ -209,7 +202,6 @@ def bootstrap_gaussian_delta(R, alpha=0.05, B=512, eps=1e-9, rng=None):
     return float(xp.quantile(deltas, 1.0 - alpha))
 
 
-
 # ---------------------------------------------------------------
 # Optimization
 # ---------------------------------------------------------------
@@ -225,9 +217,10 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
       - 'bootstrap_np'       : Nonparametric bootstrap quantile of W2( P̂0, P̂0^(b) )
       - 'bootstrap_gaussian': Parametric Gaussian bootstrap using Gelbrich W2
     """
-    if not isinstance(params, dict) or "delta_method" not in params:
-        raise ValueError("A 'delta_method' must be explicitly specified in the params dictionary.")
-    method = params["delta_method"]
+
+    if not isinstance(params, dict):
+        params = {}
+    method = params.get("delta_method", "bootstrap_gaussian")  # fast, GPU-friendly default
     
     kappa  = float(kappa)
 
@@ -262,19 +255,23 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         return float(base ** exp)
 
     if method == "bootstrap_np":
+        # Fast replacement: sliced W2 with optional subsampling (no Hungarian; ~O(B·n_proj·n log n))
         assert R is not None, "bootstrap_np needs raw sample matrix R."
-        alpha  = float((params or {}).get("alpha", 0.05))
-        B      = int((params or {}).get("B", 200))
-        rng    = _rng_from_params(params or {})
-        n_src  = int(R.shape[0])
-        # Bootstrap sample size must equal source data size for the exact W2 function.
-        n_boot = n_src
-        
-        dists = []
+        alpha   = float((params or {}).get("alpha", 0.05))
+        B       = int((params or {}).get("B", 256))               # lower default
+        n_proj  = int((params or {}).get("n_proj", 128))          # slices per bootstrap
+        m_cap   = int((params or {}).get("m_cap", 4096))          # subsample cap
+        rng_np  = _rng_from_params(params or {})
+        R_xp    = xp.asarray(R, dtype=xp.float32)
+        n_src   = int(R_xp.shape[0])
+        # subsample to m ≤ m_cap for each bootstrap (keeping equal sizes)
+        m       = int(min(n_src, m_cap))
+        dists   = []
         for _ in range(B):
-            idx = rng.integers(0, n_src, size=n_boot)
-            Rb = R[idx]
-            dists.append(w2_empirical_uniform_exact(R, Rb))
+            idx = rng_np.integers(0, n_src, size=m)
+            Rb  = R_xp[idx]
+            # sliced-W2 (works best when sizes match; we enforce m==m)
+            dists.append(sliced_w2_empirical(R_xp[:m], Rb, n_proj=n_proj, rng=None))
         return float(xp.quantile(xp.asarray(dists), 1.0 - alpha))
 
     if method == "bootstrap_gaussian":
@@ -286,7 +283,6 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         return bootstrap_gaussian_delta(R, alpha=alpha, B=B, eps=eps, rng=rng)
     
     raise ValueError(f"Unknown delta_method='{method}'")
-    
 
 def psd_cholesky(Sigma, eps):
     """Symmetrize, regularize to PSD, then return Cholesky factor L s.t. L.T @ L ≈ Sigma_psd."""
@@ -302,6 +298,114 @@ def psd_cholesky(Sigma, eps):
         L = xp.linalg.cholesky(Sigma_psd)
         return L
 
+def solve_optimizer_kkt(mu, Sigma, delta, config, max_it=50, tol=1e-7):
+    """
+    Solve:  maximize   mu^T w - delta * ||w||_2
+            subject to ||L w||_2 <= r_b,  1^T w = 1
+    Using KKT with worst-case u* = delta * w / ||w|| and scalar λ for the ellipsoidal constraint.
+    Iteration: fix u, solve linear KKT for (w, ν) at given λ, then bisection on λ to hit ||L w||=r_b.
+    """
+    rb   = float(config["risk_budget"])
+    eps  = float(config["epsilon_sigma"])
+    mu   = xp.asarray(mu, dtype=xp.float64).reshape(-1)
+    Sigma= xp.asarray(Sigma, dtype=xp.float64)
+    n    = mu.size
+    I    = xp.eye(n, dtype=mu.dtype)
+    L    = psd_cholesky(Sigma, eps)  # (n,n)
+    LtL  = L.T @ L
+    
+    # ---- Feasibility precheck: min ||L w|| s.t. 1^T w = 1
+    one = xp.ones(n, dtype=mu.dtype)
+    # Use pseudoinverse for robustness
+    try:
+        z = xp.linalg.solve(LtL, one)
+    except xp.linalg.LinAlgError:
+        z = xp.linalg.pinv(LtL) @ one
+    den = float(one @ z)
+    if abs(den) < 1e-16:
+        raise RuntimeError("Feasibility check failed: singular LtL with 1^T w = 1.")
+    w_min = z / den
+    rb_min = float(xp.linalg.norm(L @ w_min))
+    if rb < rb_min - 1e-12:
+        raise RuntimeError(f"Infeasible risk budget: rho={rb:.6g} < rho_min={rb_min:.6g}")
+
+    # helper: given u and λ, solve (2λ LtL + t I) w + ν 1 = mu - u, with 1^T w = 1
+    # use a tiny Tikhonov (t) to keep system well-conditioned when λ≈0
+    def solve_given_u_lambda(u, lam, t=None):
+        # ridge scaled to matrix magnitude
+        if t is None:
+            t = 1e-10 * (float(xp.trace(LtL)) / max(n,1) + 1.0)
+        A = 2.0*lam*LtL + t*I
+        # Solve KKT:
+        # [A   1][w] = [mu-u]
+        # [1^T 0][ν]   [  1  ]
+        # Use Schur complement on ν
+        # s = 1^T A^{-1} 1 ; ν = (1 - 1^T A^{-1} (mu-u)) / s
+        # w = A^{-1} (mu-u - ν 1)
+
+        try:
+            chol = xp.linalg.cholesky(A)  # U (upper), A = U^T U
+            def Ainv(b):
+                y = xp.linalg.solve(chol.T, b)  # solve U^T y = b
+                return xp.linalg.solve(chol, y) # solve U x  = y
+ 
+        except xp.linalg.LinAlgError:
+            # Fallback to symmetric solve
+            def Ainv(b):
+                return xp.linalg.solve(A, b)
+
+        one = xp.ones(n, dtype=mu.dtype)
+        Au1 = Ainv(one)
+        rhs = mu - u
+        Aurb= Ainv(rhs)
+        s   = float(one @ Au1)
+        num = 1.0 - float(one @ Aurb)
+        nu  = num / max(s, 1e-18)
+        w   = Ainv(rhs - nu*one)
+        return w, nu
+
+    # outer fixed-point on u = delta * w / ||w||
+    u = xp.zeros_like(mu)
+    for it in range(max_it):
+        
+        # inner bisection on λ to meet ||L w|| = rb (monotone ↓ in λ)
+        lam_lo, lam_hi = 0.0, 1.0
+
+        # ensure upper bracket yields bw <= rb (feasible boundary)
+        for _ in range(60):
+            w_hi, _ = solve_given_u_lambda(u, lam_hi)
+            bw_hi = float(xp.linalg.norm(L @ w_hi))
+            if (bw_hi <= rb) or (lam_hi > 1e12):
+                break
+            lam_hi *= 2.0
+
+        # if even huge λ doesn’t reduce below rb, the check above would have caught infeasibility
+        # bisection on [lam_lo, lam_hi]
+        w_best = w_hi
+        for _ in range(80):
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            w_mid, _ = solve_given_u_lambda(u, lam_mid)
+            bw_mid = float(xp.linalg.norm(L @ w_mid))
+            w_best = w_mid
+            if abs(bw_mid - rb) <= 1e-8 or (lam_hi - lam_lo) <= max(1e-14, 1e-10 * lam_hi):
+                break
+            if bw_mid > rb:
+                lam_lo = lam_mid
+            else:
+                lam_hi = lam_mid
+
+        w = w_best
+        
+        wn = float(xp.linalg.norm(w))
+        if delta == 0.0 or wn < 1e-15:
+            break
+        u_new = (delta / max(wn, 1e-15)) * w
+        if float(xp.linalg.norm(u_new - u)) <= tol * (1.0 + float(xp.linalg.norm(u_new))):
+            u = u_new
+            break
+        u = u_new
+    return xp.asarray(w).reshape(-1)
+
 def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     import numpy as _np
     n = len(mu); rb = config["risk_budget"]; eps = config["epsilon_sigma"]
@@ -312,25 +416,54 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     mu = _np.asarray(mu)
     # Sigma isn't used directly by CVXPY; no need to convert unless you do
 
-    w = cp.Variable(n)
-    constraints = [cp.norm(L @ w, 2) <= rb, cp.sum(w) == 1]
-    objective   = cp.Maximize(mu @ w - delta * cp.norm(w, 2))
-    prob = cp.Problem(objective, constraints)
-
+    # ---- Fast KKT solver (no CVXPY) ----
     try:
-        if GPU:
-            prob.solve(solver=cp.SCS, gpu=True, verbose=verbose,
-                       max_iters=20000, eps=1e-5, acceleration_lookback=10)
-        else:
-            prob.solve(solver=cp.MOSEK, verbose=verbose)
-    
-    except Exception:
-        # fallback on CPU SCS if MOSEK not available
-        prob.solve(solver=cp.SCS, verbose=verbose,
-                   max_iters=20000, eps=1e-5, acceleration_lookback=10)
+        w_fast = solve_optimizer_kkt(mu, Sigma, float(delta), {"risk_budget": rb, "epsilon_sigma": eps})
+        return xp.asarray(w_fast).reshape(-1)
+    except Exception as _e:
+        if verbose:
+            print("KKT solver failed, falling back to CVXPY:", _e)
 
-    if w.value is None or prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        return None
+    # Convex form: minimize  δ‖w‖₂ − μᵀw  s.t. ‖Lw‖₂ ≤ ρ, 1ᵀw = 1
+    w = cp.Variable(n)
+    rb_safe = float(max(rb, 1e-12))
+    Ls = L / rb_safe                    # scale cone: ‖Ls w‖₂ ≤ 1  (improves conditioning)
+    constraints = [cp.norm(Ls @ w, 2) <= 1, cp.sum(w) == 1]
+    objective   = cp.Minimize(delta * cp.norm(w, 2) - mu @ w)
+    prob = cp.Problem(objective, constraints)
+    
+    # -------- Clarabel (primary) --------
+    # Clarabel’s CVXPY wrapper DOES NOT accept 'max_iters' — use 'max_iter' if you set one.
+    # Start with no extra settings (most robust). Then a second pass with mild settings if needed.
+    try:
+        prob.solve(solver=cp.CLARABEL, verbose=verbose)
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            # one more Clarabel attempt with mild settings (valid kw names!)
+            prob.solve(
+                solver=cp.CLARABEL,
+                verbose=True if verbose else False,
+                max_iter=10000,            # <-- correct key (no 's')
+                tol_gap_abs=1e-8,
+                tol_gap_rel=1e-8,
+                tol_feas=1e-8,)
+            
+    except Exception as e:
+        if verbose:
+            print("Clarabel failed:", e)
+    
+    # If Clarabel didn’t deliver, use ECOS as a *backup* (still no SCS).
+    if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
+        prob.solve(
+            solver=cp.ECOS,
+            verbose=verbose,
+            max_iters=10000,
+            warm_start=True,
+            abstol=1e-8, reltol=1e-8, feastol=1e-8,
+            abstol_inacc=1e-7, reltol_inacc=1e-7, feastol_inacc=1e-7,)
+    
+    if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
+        raise RuntimeError(f"Solve failed with status={prob.status}")
+    
     return xp.asarray(w.value).reshape(-1)
 
 # ---------------------------------------------------------------
@@ -343,14 +476,12 @@ def fit_mvo(data, params, G):
                         {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
     return {"type": "static", "w": w, "kappa": 0.0, "delta": delta}
 
-
 def fit_dro(data, params, G):
     delta = compute_delta(params.get("kappa", 1.0),
                           data["mu_ann_full"], data["Sigma_ann_full"], data["train"], params)
     w = solve_optimizer(data["mu_ann_full"], data["Sigma_ann_full"], delta,
                         {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
     return {"type": "static", "w": w, "kappa": params.get("kappa", xp.nan), "delta": float(delta)}
-
 
 def fit_regime_dro(data, params, G):
     n_days = data["n_days"]
@@ -399,7 +530,6 @@ def fit_regime_dro(data, params, G):
             "delta_list": deltas,
             "delta": xp.nan}
 
-
 def fit_dro_reverse(data, params, G):
     """
     Reverse-optimised scalar δ (provided by caller).
@@ -409,7 +539,6 @@ def fit_dro_reverse(data, params, G):
     w = solve_optimizer(data["mu_ann_full"], data["Sigma_ann_full"], delta,
                         {"risk_budget": G["risk_budget"], "epsilon_sigma": G["epsilon_sigma"]})
     return {"type": "static", "w": w, "delta": delta, "kappa": xp.nan}
-
 
 def fit_regime_dro_reverse(data, params, G):
     """
@@ -442,7 +571,6 @@ def fit_regime_dro_reverse(data, params, G):
 
     return {"type": "piecewise", "w_list": w_list, "segs": segs,
             "delta_list": delta_list, "kappa": xp.nan}
-
 
 def fit_regime_dro_rev_constSigma(data, params, G):
     segs = params["segs"]
@@ -565,7 +693,6 @@ def stats_from_series(port_daily, config):
     sharpe_annual = (xp.mean(port_daily) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
     return float(mu_annual_geom), float(sigma_annual), float(sharpe_annual)
 
-
 def _max_drawdown_from_series(port_daily):
     """
     Max drawdown of a daily-return series.
@@ -613,6 +740,7 @@ def portfolio_stats_multipiece(w_list, taus, returns, config):
         "sharpe_ann": sharpe_annual,
         "vol_breach": vol_breach,
         "max_drawdown": max_dd,}
+
 
 # ---------------------------------------------------------------
 # Statistical tests (for hypothesis testing)
@@ -834,7 +962,6 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
         table[m] = pd.Series(s)
     return pd.DataFrame(table).reindex(rows)
 
-
 def print_oos_table(results_dict, model_order):
     n_by_model = {m: len(results_dict[m]) for m in model_order if m in results_dict}
     single = all(n==1 for n in n_by_model.values()) and len(n_by_model)>0
@@ -1005,6 +1132,7 @@ def _fmt4(a):
         separator=' ',
         formatter={'float_kind': lambda x: f"{x:.4f}"})
 
+
 # -------------------------
 # Pipeline helpers
 # -------------------------
@@ -1132,27 +1260,54 @@ def pooled_moments_by_regime(R_df, Z_labels, t_idx, ann=252, min_pair=60, mode="
         mu_d[i]  = float(xp.nanmean(li)) if li.size else 0.0
         var_d[i] = float(xp.nanvar(li, ddof=1)) if li.size > 1 else 0.0
 
-    Sig_d = xp.zeros((N, N))
+    Sig_d = xp.zeros((N, N), dtype=L.dtype)
     if mode == "diag":
         xp.fill_diagonal(Sig_d, var_d)
     else:
-        min_pairs = xp.inf
+        # Build availability & regime masks (T x N)
+        M_avail = ~xp.isnan(L)                                    # non-NaN
+        # per-asset regime indicator for the CURRENT state s[i]
+        G_mask  = xp.zeros_like(M_avail, dtype=bool)
+        for i, n in enumerate(names):
+            if valid_asset[i]:
+                # rows where asset i is in state s[i]
+                zi = xp.asarray(Z_labels[n])
+                G_mask[:, i] = (zi == s[i])
+        W = M_avail & G_mask                                      # rows used per asset
+
+        # Centered data with weights:
+        # counts per asset, means, then centered with zeros where W=0
+        n_i   = xp.maximum(W.sum(axis=0, dtype=L.dtype), 0.0)     # (N,)
+        one_t = xp.ones((L.shape[0],), dtype=L.dtype)
+        # sums per asset over active rows
+        sums  = (W * L).sum(axis=0)
+        means = xp.where(n_i > 0, sums / n_i, 0.0)
+        Xc    = xp.where(W, L - means[None, :], 0.0)
+
+        # Pairwise counts and cross-sums via GEMM
+        N_ij  = (W.astype(L.dtype)).T @ W.astype(L.dtype)         # (N,N)
+        S_ij  = Xc.T @ Xc                                         # sum of products over overlaps
+
+        # Unbiased covariance where N_ij>=2
+        with xp.errstate(invalid="ignore", divide="ignore"):
+            C_ij = xp.where(N_ij >= 2.0, S_ij / (N_ij - 1.0), 0.0)
+
+        # Set diagonal to sample variances computed earlier
         for i in range(N):
-            for j in range(i, N):
-                if not (valid_asset[i] and valid_asset[j]):
-                    cij = 0.0 if i != j else var_d[i]
-                else:
-                    S_ij = xp.intersect1d(S_sets[i], S_sets[j], assume_unique=False)
-                    # drop rows where either return is NaN (already filtered in S_i by column-wise)
-                    if S_ij.size >= 2:
-                        cij = xp.cov(L[S_ij, i], L[S_ij, j], ddof=1)[0, 1]
-                    else:
-                        cij = 0.0 if i != j else var_d[i]
-                    min_pairs = min(min_pairs, S_ij.size if S_ij.size else xp.inf)
-                Sig_d[i, j] = Sig_d[j, i] = float(cij)
-        # shrink if pairwise sample is thin
-        if not xp.isinf(min_pairs):
-            lam = float(min(1.0, (min_pair / max(int(min_pairs), 1))))
+            C_ij[i, i] = var_d[i]
+        Sig_d = C_ij
+
+        # shrink if pairwise sample is thin (use min observed overlap off-diagonal)
+        off = ~xp.eye(N, dtype=bool)
+        with xp.errstate(all="ignore"):
+            N_ij_off = xp.where(off, N_ij, xp.nan)
+            # handle corner case: no off-diagonal overlaps -> skip shrink
+            if xp.all(xp.isnan(N_ij_off)):
+                min_pairs = xp.inf
+            else:
+                min_pairs = float(xp.nanmin(N_ij_off))
+        if xp.isfinite(min_pairs):
+            lam = float(min(1.0, max(0.0, (min_pair / max(int(min_pairs), 1)))))  # in [0,1]
             Sig_d = (1 - lam) * Sig_d + lam * xp.diag(xp.diag(Sig_d))
 
     mu_ann  = xp.expm1(ann * mu_d)
@@ -1230,7 +1385,6 @@ def _select_best_config(results_df, security, prefer_configs=None):
         return None
     return str(df.iloc[0]["config"])
 
-
 def _labels_from_segments_df(segments_df, security, config):
     df = segments_df[(segments_df["security"] == security) &
                      (segments_df["config"] == config)].copy()
@@ -1244,6 +1398,7 @@ def _labels_from_segments_df(segments_df, security, config):
         df["z"].astype(int).to_numpy(),
         index=pd.DatetimeIndex(df["date"]),
         name="z",)
+
 
 # -------------------------
 # Pipeline
@@ -1277,8 +1432,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         have = set(df_res["security"].unique())
         missing = sorted(req - have)
         assert not missing, (
-            f"[gridsearch check] Missing {len(missing)} in results CSV: " + ", ".join(missing)
-        )
+            f"[gridsearch check] Missing {len(missing)} in results CSV: " + ", ".join(missing))
 
     # also ensure presence in segments parquet
     df_seg_header = pd.read_parquet(seg_parq, columns=["security"])  # light read
@@ -1287,8 +1441,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     have_seg = set(df_seg_header["security"].astype(str).str.strip().unique())
     missing_seg = sorted(set(securities) - have_seg)
     assert not missing_seg, (
-        f"[segments check] Missing {len(missing_seg)} in segments parquet: " + ", ".join(missing_seg)
-    )
+        f"[segments check] Missing {len(missing_seg)} in segments parquet: " + ", ".join(missing_seg))
 
     # --- Panels (now that `securities` is known/validated) ---
     px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])
@@ -1475,6 +1628,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             "px_cols": list(A_k),
             "index": R_df_k.index
         }
+        
         paramsR = dict(CONFIG["delta_defaults"][CONFIG["delta_name"]])
         paramsR["use_moments_override"] = True
     
@@ -1546,14 +1700,22 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             print(f"  k={k}: {_fmt4(w_k)}", flush=True)
 
     # Save results
-    save_out(out, CONFIG["dro_pickle"])
-    
-    return {
+    out = {
         "MVO":   {"fit": fit_mvo0, "summary": summ_mvo0},
         "PartA": {"fit": fitA, "data": dataA, "summary": summA},
         "PartB": {"fit": fitB, "summary": summB,
-                  "per_asset_segs": per_asset_segs_on_cal, "global_segs": taus,
-                  "Z_labels": Z_labels},
+                  "per_asset_segs": per_asset_segs_on_cal, 
+                  "global_segs": taus, "Z_labels": Z_labels},
         "returns_union": R_df_all,
-        "series": {"MVO_daily": mvo_daily, "PartA_daily": partA_daily, "PartB_daily": partB_daily},
-        "securities": avail}
+        "series": {"MVO_daily": mvo_daily, 
+                   "PartA_daily": partA_daily, 
+                   "PartB_daily": partB_daily},
+        "securities": avail
+    }
+
+    # Save results (if path configured)
+    if "dro_pickle" in CONFIG and CONFIG["dro_pickle"]:
+        save_out(out, CONFIG["dro_pickle"])
+
+    return out
+
