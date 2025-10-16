@@ -221,3 +221,4 @@ Data/
 /Output
 *.gz
 Output/dro_run.pkl.gz
+*.gz
