@@ -220,3 +220,4 @@ Data/
 .DS_Store
 /Output
 *.gz
+Output/dro_run.pkl.gz
