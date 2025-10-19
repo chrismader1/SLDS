@@ -1338,9 +1338,16 @@ def report_dro(fit, data, G, label="DRO"):
 def report_regdro(fit, data, G, taus_true=None, label="RegDRO"):
     _section(f"{label}: piecewise portfolio")
     segs = fit.get("segs", [])
-    dlist = [fit.get(f"delta_k{k+1}", None) for k in range(len(segs)-1)]
-    if not any(np.isfinite(dlist)):
-        dlist = list(map(float, fit.get("delta_list", [])))
+    _raw_dlist = [fit.get(f"delta_k{k+1}", None) for k in range(len(segs)-1)]
+    def _to_float_or_nan(x):
+        try:
+            return float(np.asarray(x).squeeze())
+        except Exception:
+            return np.nan
+    _dlist = np.array([_to_float_or_nan(x) for x in _raw_dlist], dtype=float)
+    if not np.isfinite(_dlist).any():
+        _dlist = np.array([_to_float_or_nan(x) for x in fit.get("delta_list", [])], dtype=float)
+    dlist = _dlist.tolist()
     if taus_true is None:
         taus_true = data.get("taus_true", [0, data["n_days"]])
 
