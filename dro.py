@@ -69,7 +69,7 @@ def load_out(path: str) -> dict:
 
 
 # ---------------------------------------------------------------
-# Wasserstein helperS
+# Wasserstein helpers
 # ---------------------------------------------------------------
 
 def _rng_from_params(params):
@@ -291,18 +291,19 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         # ensure device RNG when on GPU (repro if seed provided)
         seed = (params or {}).get("seed", None)
         if GPU and (seed is not None):
-            xp.random.seed(int(seed))
-        
+            xp.random.seed(int(seed))      
         dists = []
         for _ in range(B):
             if GPU:
-                idx = xp.random.randint(0, n_src, size=m)          # device indices
+                idx1 = xp.random.randint(0, n_src, size=m)
+                idx2 = xp.random.randint(0, n_src, size=m)
             else:
-                idx = rng_np.integers(0, n_src, size=m)            # NumPy on CPU
-            idx = xp.asarray(idx, dtype=xp.int64)                  # ensure xp index dtype
-            Rb  = R_xp[idx]
-            dists.append(sliced_w2_empirical(R_xp[:m], Rb, n_proj=n_proj, rng=None))
-        
+                idx1 = rng_np.integers(0, n_src, size=m)
+                idx2 = rng_np.integers(0, n_src, size=m)
+            idx1 = xp.asarray(idx1, dtype=xp.int64)
+            idx2 = xp.asarray(idx2, dtype=xp.int64)
+            dists.append(sliced_w2_empirical(R_xp[idx1], R_xp[idx2], n_proj=n_proj, rng=None))
+ 
         return float(xp.quantile(xp.asarray(dists), 1.0 - alpha))
 
     if method == "bootstrap_gaussian":
@@ -739,13 +740,27 @@ def evaluate_portfolio(fit, data, G):
     n_days = data["n_days"]
     AF = int(data.get("ann_factor", 252))
     if fit["type"] == "static":
-        stats_oos = portfolio_stats(fit["w"], test, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], 
-                                                     "risk_budget": G["risk_budget"], "annualization_factor": AF})
+        stats_oos = portfolio_stats(
+            fit["w"], test, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"],
+                             "risk_budget": G["risk_budget"], "annualization_factor": AF})
         ge = float(xp.sum(xp.abs(fit["w"])))
         port_tr = train @ fit["w"]
-        _, risk_tr, _ = stats_from_series(port_tr, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
+        _, sigma_train_ann, _ = stats_from_series(
+            port_tr,
+            {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
+        # SOC (training) risk: ||L w||_2 where L^T L ≈ Σ_ann (if available)
+        train_soc = float("nan")
+        if isinstance(data, dict) and ("Sigma_ann_full" in data) and (data["Sigma_ann_full"] is not None):
+            L = psd_factor_LtL(data["Sigma_ann_full"], G["epsilon_sigma"])
+            train_soc = float(xp.linalg.norm(L @ fit["w"]))
+        
+        # enrich & rename “gap”
         stats_oos["gross_exp"] = ge
-        stats_oos["gap"] = float(stats_oos["sigma_ann"] - risk_tr)
+        stats_oos["sigma_train_ann"] = float(sigma_train_ann)
+        stats_oos["sigma_oos_ann"] = float(stats_oos["sigma_ann"])
+        stats_oos["gap_oos_vs_train_realized"] = float(stats_oos["sigma_ann"] - sigma_train_ann)
+        stats_oos["train_soc_risk"] = train_soc
+        stats_oos["train_constraint_slack"] = float(G["risk_budget"] - train_soc) if xp.isfinite(train_soc) else xp.nan
         stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
         stats_oos["delta"] = float(fit.get("delta", xp.nan))
         rebal = [0, n_days]
@@ -754,17 +769,23 @@ def evaluate_portfolio(fit, data, G):
     
     else:  # piecewise
         cfg = {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "risk_budget": G["risk_budget"], "annualization_factor": AF}
+        
         stats_oos = portfolio_stats_multipiece(fit["w_list"], fit["segs"], test, cfg)
         seg_lengths = xp.diff(xp.array(fit["segs"]))
         ge = float(xp.sum(seg_lengths * xp.array([xp.sum(xp.abs(wk)) for wk in fit["w_list"]])) / n_days)
-
+        
         port_tr = xp.zeros(n_days)
-        for (a,b), wk in zip(zip(fit["segs"][:-1], fit["segs"][1:]), fit["w_list"]):
+        for (a,b), wk in zip(zip(fit["w_list"] and fit["segs"][:-1], fit["segs"][1:]), fit["w_list"]):
             port_tr[a:b] = train[a:b] @ wk
-        _, risk_tr, _ = stats_from_series(port_tr, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
-
+        _, sigma_train_ann, _ = stats_from_series(
+            port_tr, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
         stats_oos["gross_exp"] = ge
-        stats_oos["gap"] = float(stats_oos["sigma_ann"] - risk_tr)
+        stats_oos["sigma_train_ann"] = float(sigma_train_ann)
+        stats_oos["sigma_oos_ann"]  = float(stats_oos["sigma_ann"])
+        stats_oos["gap_oos_vs_train_realized"] = float(stats_oos["sigma_ann"] - sigma_train_ann)
+        # SOC per-piece not available here → leave NaN placeholders
+        stats_oos["train_soc_risk"] = xp.nan
+        stats_oos["train_constraint_slack"] = xp.nan
         stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
 
         # Aggregate per-segment deltas
@@ -836,7 +857,7 @@ def evaluate_regime_independently(fit, data, G):
 def stats_from_series(port_daily, config):
     n_days = config["n_days"]
     rf_annual = config["risk_free_rate"]
-    AF = int(config.get("annualization_factor", n_days))  # fallback to old behavior if not set
+    AF = int(config.get("annualization_factor", 252))
     rf_daily = (1 + rf_annual) ** (1 / AF) - 1
     sigma_daily = xp.std(port_daily, ddof=1)
     sigma_annual = sigma_daily * xp.sqrt(AF)
@@ -1078,7 +1099,8 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
     Cols: in the order provided by `model_order` (or insertion order of `results`).
     """
     base_rows = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","p_viol",
-                 "gross_exp","kappa","gap","delta_mean","delta_min","delta_max","max_drawdown"]
+                 "gross_exp","kappa","gap","delta_mean","delta_min",
+                 "delta_max","max_drawdown", "hit_rate"]  
     if model_order is None:
         model_order = list(results.keys())
 
@@ -1119,7 +1141,8 @@ def print_oos_table(results_dict, model_order):
         
 def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sigma_ann, config, rtol=1e-6, atol=1e-9):
     n_days, n_assets = returns_train.shape
-    AF = int(config.get("annualization_factor", config["n_days"]))
+    # AF = int(config.get("annualization_factor", config["n_days"]))
+    AF = int(config.get("annualization_factor", 252))
     mu_train_ann_assets    = AF * returns_train.mean(axis=0)
     sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
 
@@ -1181,8 +1204,8 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
     Uses 'annualization_factor' (AF) if provided in config, else falls back to n_days.
     """
     n_days, n_assets = returns_train.shape
-    AF = int((config or {}).get("annualization_factor",
-                                (config or {}).get("n_days", n_days)))
+    # AF = int((config or {}).get("annualization_factor", (config or {}).get("n_days", n_days)))
+    AF = int((config or {}).get("annualization_factor", 252))
 
     # concatenated series for realized stats (like multi-trial)
     port_train = xp.zeros(n_days); port_eval = xp.zeros(n_days)
@@ -1511,8 +1534,8 @@ def make_data_from_returns_panel_pairwise(R: pd.DataFrame, ann_factor=252, min_p
     mu_d = xp.nanmean(L, axis=0)
     Sig_d = C
     return {
-        "train": xp.nan_to_num(xp.asarray(X), nan=0.0),   # content not used by solver when moments override
-        "test":  xp.nan_to_num(xp.asarray(X), nan=0.0),
+        "train": xp.asarray(X),     # keep NaNs for series; handle NaNs only inside moment estimators
+        "test":  xp.asarray(X),
         "n_days": T, "ann_factor": ann_factor,
         "mu_ann_full": xp.expm1(mu_d * ann_factor),
         "Sigma_ann_full": Sig_d * ann_factor,
@@ -1793,7 +1816,39 @@ def _make_solver_cfg_from_CONFIG(CONFIG):
         "long_only":      bool(P.get("long_only", False)),
         "no_leverage":    bool(P.get("no_leverage", False)),
     }
-    
+
+def _select_regime_set_S_star_from_train(px_train: pd.Series, zhat_train: np.ndarray, dt: float) -> set:
+    """
+    Pick S* (subset of regimes) by maximizing in-sample CAGR_rel using the
+    0/1 mapping w_k ∈ {0,1}. Returns set of regimes with w_k=1.
+    """
+    regimes = np.unique(zhat_train)
+    # daily returns (fillna 0 so cumprod works cleanly)
+    bench_ret = px_train.pct_change().fillna(0.0)
+    bench_idx = (1.0 + bench_ret).cumprod()
+    n_years = len(bench_ret) * dt
+    cagr_bench = bench_idx.iloc[-1] ** (1.0 / max(n_years, 1e-12)) - 1.0
+
+    best_cagr_rel, best_S = -np.inf, set()
+    # try all non-trivial 0/1 assignments (at least one 0 and one 1)
+    import itertools
+    for w in itertools.product([0, 1], repeat=len(regimes)):
+        if 0 not in w or 1 not in w:
+            continue
+        S = {rk for rk, val in zip(regimes, w) if val == 1}
+        weights = np.array([1 if z in S else 0 for z in zhat_train], dtype=float)
+        strat_ret = bench_ret.values * weights
+        strat_idx = np.cumprod(1.0 + strat_ret)
+        cagr_strat = strat_idx[-1] ** (1.0 / max(n_years, 1e-12)) - 1.0
+        cagr_rel = (1.0 + cagr_strat) / (1.0 + cagr_bench) - 1.0
+        if cagr_rel > best_cagr_rel:
+            best_cagr_rel, best_S = cagr_rel, S
+    return best_S
+
+def _signals_from_zhat(zhat: np.ndarray, S_star: set) -> np.ndarray:
+    """Binary signal: 1 if zhat(t) ∈ S*, else 0."""
+    return np.array([1 if z in S_star else 0 for z in zhat], dtype=int)
+
 # -------------------------
 # Pipeline
 # -------------------------
@@ -2284,6 +2339,63 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         # Nothing to return in the requested range given availability
         raise RuntimeError("Requested [start_dt, end_dt] produced an empty common window.")
 
+    # --- Signals & Hit Rate (OOS) -------------------------------------------
+    # Build S* on TRAIN (dates strictly before requested_idx[0]) per asset,
+    # then compute OOS signals on requested_idx and the hit rate.
+    dt = 1.0 / 252.0
+    first_oos_dt = requested_idx[0]
+    cal_full = R_df_all.index
+
+    # OOS returns panel (keep NaN; we’ll mask them)
+    R_oos = R_df_all.loc[requested_idx, avail]
+
+    signals_oos_cols = {}
+    for tic in avail:
+        # align PX and labels to the union calendar
+        px_ser_full = _num_series(px_all[tic].reindex(cal_full))
+        z_full = np.asarray(Z_labels[tic], dtype=float)
+
+        # TRAIN mask: dates strictly before OOS window
+        train_mask = (cal_full < first_oos_dt)
+        # keep only dates where we have both label and price
+        train_mask &= np.isfinite(z_full)
+        train_mask &= px_ser_full.notna().to_numpy()
+
+        if train_mask.sum() < 2:
+            # degenerate: no train history to choose S* → fall back to empty S*
+            S_star = set()
+        else:
+            px_train = px_ser_full.loc[cal_full[train_mask]]
+            zhat_train = z_full[train_mask].astype(int, copy=False)
+            S_star = _select_regime_set_S_star_from_train(px_train=px_train, zhat_train=zhat_train, dt=dt)
+
+        # OOS signals on requested_idx
+        z_oos = z_full[np.isin(cal_full, requested_idx)]
+        sig_oos = _signals_from_zhat(z_oos.astype(int, copy=False), S_star)
+
+        # align to R_oos index for this ticker (length match safeguard)
+        sig_oos = np.asarray(sig_oos, dtype=int)[:len(R_oos.index)]
+        if len(sig_oos) < len(R_oos.index):
+            pad = np.zeros(len(R_oos.index) - len(sig_oos), dtype=int)
+            sig_oos = np.concatenate([sig_oos, pad])
+        signals_oos_cols[tic] = pd.Series(sig_oos, index=R_oos.index)
+
+    signals_oos = pd.DataFrame(signals_oos_cols, index=R_oos.index).astype(int)
+
+    # --- Hit rate: P(return >= 0 | signal == 1) ------------------------------
+    mask = (signals_oos == 1) & R_oos.notna()
+    hits_per_asset = ((R_oos >= 0) & mask).sum(axis=0)
+    trials_per_asset = mask.sum(axis=0).replace(0, np.nan)
+    hit_rate_by_asset = (hits_per_asset / trials_per_asset).fillna(0.0)
+
+    total_hits = ((R_oos >= 0) & mask).to_numpy().sum()
+    total_trials = mask.to_numpy().sum()
+    hit_rate_overall = float(total_hits / total_trials) if total_trials > 0 else 0.0
+
+    # (optional) console log
+    print(f"[Signals] OOS hit rate (overall): {hit_rate_overall:.4f}")
+    # -------------------------------------------------------------------------
+
     # Overwrite the three series with the aligned, *requested* versions
     mvo_daily   = mvo_daily.reindex(requested_idx).astype(float)
     partA_daily = partA_daily.reindex(requested_idx).astype(float)
@@ -2317,23 +2429,21 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     df_mvo = pd.DataFrame([summ_mvo0]).copy()
     df_dro = pd.DataFrame([summA]).copy()
 
-    '''
-    df_reg = pd.DataFrame([summB]).copy()
-    # Attach per-segment deltas for RegDRO as separate columns (delta_k1, delta_k2, …)
-    if "delta_list" in fitB and fitB["delta_list"]:
-        for j, dj in enumerate(fitB["delta_list"], start=1):
-            df_reg[f"delta_k{j}"] = float(dj) if dj is not None else float("nan")
-    '''
     df_reg = pd.DataFrame([summB]).copy()
     if "delta_list" in fitB and fitB["delta_list"]:
         _d = pd.Series([float(x) if x is not None else float("nan") for x in fitB["delta_list"]])
         df_reg["delta_mean"] = float(_d.mean(skipna=True))
         df_reg["delta_min"]  = float(_d.min(skipna=True))
         df_reg["delta_max"]  = float(_d.max(skipna=True))
-    
+
+    # show hit rate under all columns (same overall OOS hit rate) ---
+    df_mvo["hit_rate"] = float(hit_rate_overall)
+    df_dro["hit_rate"] = float(hit_rate_overall)
+    df_reg["hit_rate"] = float(hit_rate_overall)
+
     # 2) Print a single, clean table with MVO, DRO, RegDRO columns
-    results_dict = {"MVO": df_mvo, "DRO": df_dro, "RegDRO": df_reg}
-    print_oos_table(results_dict, model_order=["MVO", "DRO", "RegDRO"])
+    results_dict = {"MVO": df_mvo, "DRO-rebal": df_dro, "RegDRO": df_reg}
+    print_oos_table(results_dict, model_order=["MVO", "DRO-rebal", "RegDRO"])
     
     # 3) Also show the detailed RegDRO block (weights by segment, piece boundaries, per-piece δk)
     _section("RegDRO — detailed piecewise report")
@@ -2372,7 +2482,13 @@ def dro_pipeline(securities, CONFIG, verbose=True):
                         "n_days": len(R_df_all.index),
                         "ann_factor": 252
                     }, "summary": summB}
-    
+
+    # expose signals & hit rates (per-asset and overall) --------------
+    out["signals"] = {
+        "signals_oos": signals_oos,  # DataFrame indexed by requested_idx, cols=avail
+        "hit_rate_by_asset": hit_rate_by_asset.to_dict(),
+        "hit_rate_overall": float(hit_rate_overall),
+    }
 
     # Save results (if path configured)
     if "dro_pickle" in CONFIG and CONFIG["dro_pickle"]:
