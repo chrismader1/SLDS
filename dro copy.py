@@ -2291,20 +2291,28 @@ def _wilson_ci(k: int, n: int, alpha: float = 0.05):
     high = (center + margin) / denom
     return float(max(0.0, low)), float(min(1.0, high))
 
-def hit_rate_vs_bench_stats(model_series, bench_series, index_ref, alpha=0.05):
+def hit_rate_vs_bench_stats(
+    model_series: pd.Series,
+    bench_series: pd.Series,
+    index_ref: pd.DatetimeIndex,
+    alpha: float = 0.05,
+) -> tuple[float, float, int, float, float]:
+    """
+    % days model return >= benchmark, returning:
+      mean, sample-std of {0,1}, n, CI_low, CI_high  (Wilson, 1-alpha)
+    """
     a = pd.Series(model_series).reindex(index_ref).astype(float)
     b = pd.Series(bench_series).reindex(index_ref).astype(float)
     mask = a.notna() & b.notna()
     if not mask.any():
         return float("nan"), float("nan"), 0, float("nan"), float("nan")
-
     z = (a[mask] - b[mask] >= 0.0).astype(float).to_numpy()
     n = int(z.size)
-    p_hat = float(z.mean())
-    se = float(np.sqrt(p_hat * (1.0 - p_hat) / n)) if n > 0 else float("nan")
+    m = float(z.mean())
+    s = float(z.std(ddof=1)) if n > 1 else 0.0
     k = int(z.sum())
     ci_low, ci_high = _wilson_ci(k, n, alpha=alpha)
-    return p_hat, se, n, ci_low, ci_high
+    return m, s, n, ci_low, ci_high
 
 def _shrunk_cov(X: np.ndarray, lam: float) -> np.ndarray:
     X = np.asarray(X, float)
@@ -2754,21 +2762,21 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     mvo_hr_mean, mvo_hr_std, _, mvo_ci_lo, mvo_ci_hi = hit_rate_vs_bench_stats(mvo_daily,  spx_daily, full_index)
     dro_hr_mean, dro_hr_std, _, dro_ci_lo, dro_ci_hi = hit_rate_vs_bench_stats(dro_daily,  spx_daily, full_index)
     reg_hr_mean, reg_hr_std, _, reg_ci_lo, reg_ci_hi = hit_rate_vs_bench_stats(regdro_daily, spx_daily, full_index)
-
-    rows_mvo["hit_rate_vs_bench"]        = mvo_hr_mean
-    rows_mvo["hit_rate_vs_bench_se"]     = mvo_hr_se
-    rows_mvo["hit_rate_vs_bench_ci_low"] = mvo_ci_lo
-    rows_mvo["hit_rate_vs_bench_ci_high"]= mvo_ci_hi
     
-    rows_dro["hit_rate_vs_bench"]        = dro_hr_mean
-    rows_dro["hit_rate_vs_bench_se"]     = dro_hr_se
-    rows_dro["hit_rate_vs_bench_ci_low"] = dro_ci_lo
-    rows_dro["hit_rate_vs_bench_ci_high"]= dro_ci_hi
+    rows_mvo["hit_rate_vs_bench"]      = mvo_hr_mean
+    rows_mvo["hit_rate_vs_bench_std"]  = mvo_hr_std
+    rows_mvo["hit_rate_vs_bench_ci_low"]  = mvo_ci_lo
+    rows_mvo["hit_rate_vs_bench_ci_high"] = mvo_ci_hi
     
-    rows_reg["hit_rate_vs_bench"]        = reg_hr_mean
-    rows_reg["hit_rate_vs_bench_se"]     = reg_hr_se
-    rows_reg["hit_rate_vs_bench_ci_low"] = reg_ci_lo
-    rows_reg["hit_rate_vs_bench_ci_high"]= reg_ci_hi
+    rows_dro["hit_rate_vs_bench"]      = dro_hr_mean
+    rows_dro["hit_rate_vs_bench_std"]  = dro_hr_std
+    rows_dro["hit_rate_vs_bench_ci_low"]  = dro_ci_lo
+    rows_dro["hit_rate_vs_bench_ci_high"] = dro_ci_hi
+    
+    rows_reg["hit_rate_vs_bench"]      = reg_hr_mean
+    rows_reg["hit_rate_vs_bench_std"]  = reg_hr_std
+    rows_reg["hit_rate_vs_bench_ci_low"]  = reg_ci_lo
+    rows_reg["hit_rate_vs_bench_ci_high"] = reg_ci_hi
 
     # Optional: SPX as its own model column in the OOS table
     # We already use SPX for alpha/TE/IR; this makes it visible as a column
