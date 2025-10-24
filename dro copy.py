@@ -1,4 +1,4 @@
-
+ 
 # ---------------------------------------------------------------
 # Import modules
 # ---------------------------------------------------------------
@@ -461,7 +461,7 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     mu_np = _np.asarray(mu, dtype=float)
     objective = cp.Minimize(float(delta) * t - mu_np @ w)
 
-    long_only   = bool(config.get("long_only", False))
+    no_shorting = bool(config.get("no_shorting", False))
     no_leverage = bool(config.get("no_leverage", False))
 
     # Base SOC constraints (outer problem epigraph)
@@ -472,13 +472,32 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     ]
 
     # Enforce w >= 0 if requested
-    if long_only:
+    if no_shorting:
         constr += [w >= 0]
 
     # Enforce sum(w) <= 1 (cash allowed, no leverage) if requested
     if no_leverage:
         constr += [cp.sum(w) <= 1]
 
+    # Max position size
+    mpos = config.get("max_pos_size", None)
+    if mpos is not None:
+        mpos = float(mpos)
+        if np.isfinite(mpos) and mpos >= 0.0:
+            if no_shorting:
+                # 0 ≤ w_i ≤ mpos
+                constr += [w <= mpos]
+            else:
+                # −mpos ≤ w_i ≤ mpos
+                constr += [cp.abs(w) <= mpos]
+    
+    # Cash cap: cash_t = max(0, 1 - sum(w)) ≤ max_cash  ⇔  sum(w) ≥ 1 - max_cash
+    mc = config.get("max_cash", None)
+    if mc is not None and _np.isfinite(float(mc)):
+        mc = float(mc)
+        mc = max(0.0, min(1.0, mc))
+        constr += [cp.sum(w) >= 1.0 - mc]
+        
     prob = cp.Problem(objective, constr)
     try:
         if verbose:
@@ -527,14 +546,14 @@ def fit_mvo_rebalanced(R_df: pd.DataFrame, G, ann: int, marks: list[int],
     for a, b in zip(marks[:-1], marks[1:]):
         # rebalance at 'a' using window [ws, a)
         if a == 0:
-            w_list.append(xp.zeros(N))
+            w_list.append(_feasible_placeholder(N, G))
             continue
         ws = _window_start(a, min_lb, max_lb)
         R_win = R_df.iloc[ws:a].dropna(how="any")
         if len(R_win) < max(2, min_lb):
-            w_list.append(w_list[-1] if w_list else xp.zeros(N))
+            w_list.append(w_list[-1] if w_list else _feasible_placeholder(N, G))
             continue
-
+   
         mu_ann, Sig_ann = _moments_from_window(R_win, ann=ann, shrink_lambda=lam_shr)
         w = solve_optimizer(mu_ann, Sig_ann, delta=0.0, config=G, verbose=False)
         if verbose:
@@ -558,13 +577,13 @@ def fit_dro_rebalanced(R_df: pd.DataFrame, params, G, ann: int, marks: list[int]
 
     for a, b in zip(marks[:-1], marks[1:]):
         if a == 0:
-            w_list.append(xp.zeros(N)); delta_list.append(xp.nan)
+            w_list.append(_feasible_placeholder(N, G)); delta_list.append(xp.nan)
             continue
         ws = _window_start(a, min_lb, max_lb)
         R_win = R_df.iloc[ws:a].dropna(how="any")
         if len(R_win) < max(2, min_lb):
             # carry forward
-            w_list.append(w_list[-1] if w_list else xp.zeros(N))
+            w_list.append(w_list[-1] if w_list else _feasible_placeholder(N, G))
             delta_list.append(delta_list[-1] if delta_list else xp.nan)
             continue
 
@@ -1174,12 +1193,14 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
     """
     
     base_rows = [
-        "mu_ann","sigma_ann","sharpe_ann","vol_breach","p_viol",
-        "gross_exp","gap_oos_vs_train_realized",
+        "mu_ann","sigma_ann","sharpe_ann","vol_breach",
+        # "p_viol",
+        "gross_exp",
+        "gap_oos_vs_train_realized",
         "delta_mean","delta_min","delta_max",
         "max_drawdown",
         "alpha_ann_vs_spx","te_ann_vs_spx","ir_vs_spx",
-        "hit_rate_vs_bench","hit_rate_vs_bench_std",
+        "hit_rate_vs_bench","hit_rate_vs_bench_se",
         "hit_rate_vs_bench_ci_low","hit_rate_vs_bench_ci_high",
 ]
 
@@ -1611,16 +1632,15 @@ def make_index_rebal_from_opt(index_opt: pd.DatetimeIndex,
 
     k = int(max(1, rebalance_period_days))
     take = np.arange(0, len(index_opt), k, dtype=int)
-    idx = index_opt.take(take)
-    if (len(idx_rebal) == 0) or (idx_rebal[-1] != idx_req[-1]):
-        idx_rebal = pd.DatetimeIndex(np.concatenate([idx_rebal.values, idx_req[-1:].values]))  
-    index_rebal = pd.DatetimeIndex(idx)
+    index_rebal = index_opt.take(take)
+    # always include last date
+    if (len(index_rebal) == 0) or (index_rebal[-1] != index_opt[-1]):
+        index_rebal = pd.DatetimeIndex(np.concatenate([index_rebal.values, index_opt[-1:].values]))
 
     pos = index_opt.get_indexer(index_rebal)
     pos = [int(p) for p in pos if p >= 0]
     marks = sorted(set([0] + pos + [len(index_opt)]))
     return index_rebal, marks
-
 
 def _num_series(s):
     return pd.to_numeric(s, errors="coerce").astype("float64")
@@ -1981,12 +2001,21 @@ def _moments_from_window(R_win: pd.DataFrame, ann: int = 252, shrink_lambda: flo
 
 def _make_solver_cfg_from_CONFIG(CONFIG):
     P = CONFIG["PORTFOLIO"]
+
+    max_cash = P.get("max_cash", None)
+    max_cash = None if max_cash is None else float(max_cash)
+
+    max_pos_size = P.get("max_pos_size", None)
+    max_pos_size = None if max_pos_size is None else float(max_pos_size)
+       
     return {
         "risk_budget":    float(P["risk_budget"]),
         "risk_free_rate": float(P["risk_free_rate"]),
         "epsilon_sigma":  float(P["epsilon_sigma"]),
-        "long_only":      bool(P.get("long_only", False)),
+        "no_shorting":    bool(P.get("no_shorting", False)),
         "no_leverage":    bool(P.get("no_leverage", False)),
+        "max_cash":       max_cash,
+        "max_pos_size":   max_pos_size,
     }
 
 def _select_regime_set_S_star_from_train(px_train: pd.Series, zhat_train: np.ndarray, dt: float) -> set:
@@ -2204,6 +2233,7 @@ def make_index_union(
 # ----------------------
 # Helpers
 # ----------------------
+
 def _expand_daily_weights(weights_on_dates: pd.DataFrame, full_index: pd.DatetimeIndex) -> pd.DataFrame:
     """Forward-fill piecewise weights to every day in full_index."""
     w = weights_on_dates.sort_index()
@@ -2291,28 +2321,20 @@ def _wilson_ci(k: int, n: int, alpha: float = 0.05):
     high = (center + margin) / denom
     return float(max(0.0, low)), float(min(1.0, high))
 
-def hit_rate_vs_bench_stats(
-    model_series: pd.Series,
-    bench_series: pd.Series,
-    index_ref: pd.DatetimeIndex,
-    alpha: float = 0.05,
-) -> tuple[float, float, int, float, float]:
-    """
-    % days model return >= benchmark, returning:
-      mean, sample-std of {0,1}, n, CI_low, CI_high  (Wilson, 1-alpha)
-    """
+def hit_rate_vs_bench_stats(model_series, bench_series, index_ref, alpha=0.05):
     a = pd.Series(model_series).reindex(index_ref).astype(float)
     b = pd.Series(bench_series).reindex(index_ref).astype(float)
     mask = a.notna() & b.notna()
     if not mask.any():
         return float("nan"), float("nan"), 0, float("nan"), float("nan")
+
     z = (a[mask] - b[mask] >= 0.0).astype(float).to_numpy()
     n = int(z.size)
-    m = float(z.mean())
-    s = float(z.std(ddof=1)) if n > 1 else 0.0
+    p_hat = float(z.mean())
+    se = float(np.sqrt(p_hat * (1.0 - p_hat) / n)) if n > 0 else float("nan")
     k = int(z.sum())
     ci_low, ci_high = _wilson_ci(k, n, alpha=alpha)
-    return m, s, n, ci_low, ci_high
+    return p_hat, se, n, ci_low, ci_high
 
 def _shrunk_cov(X: np.ndarray, lam: float) -> np.ndarray:
     X = np.asarray(X, float)
@@ -2321,6 +2343,26 @@ def _shrunk_cov(X: np.ndarray, lam: float) -> np.ndarray:
     S = (Xc.T @ Xc) / T if X.size else np.zeros((X.shape[1], X.shape[1]))
     tr = np.trace(S) / S.shape[0] if S.shape[0] else 0.0
     return (1.0 - lam) * S + lam * tr * np.eye(S.shape[0])
+
+def pnl_with_delay_and_cost(
+    W_on_dates: pd.DataFrame,
+    full_index: pd.DatetimeIndex,
+    R_df: pd.DataFrame,
+    delay: int,
+    tc: float,
+    name: str,
+):
+    """
+    Expand weights to daily, apply execution delay and transaction costs, return PnL series.
+    Transaction cost model: tc * sum_i |w_eff_t - w_eff_{t-1}| with day-1 turnover = ||w_eff_0||_1.
+    """
+    W_daily = _expand_daily_weights(W_on_dates, full_index)
+    W_eff   = W_daily.shift(int(delay)).fillna(0.0)
+    pnl_g   = (W_eff * R_df).sum(axis=1)
+    to      = W_eff.diff().abs().sum(axis=1)
+    if len(to):
+        to.iloc[0] = W_eff.iloc[0].abs().sum()
+    return (pnl_g - float(tc) * to).rename(name), W_daily, W_eff
 
 # ----------------------
 # Optimizers
@@ -2349,9 +2391,16 @@ def run_mvo(df_px, df_ret, index_rebal, CONFIG, G, solve_mvo, verbose=True):
         rows.append(pd.Series(w, index=tickers, name=dt))
 
     W_rebal = pd.DataFrame(rows).sort_index()
-    W_daily = _expand_daily_weights(W_rebal, df_px.index)
-    pnl     = (W_daily * df_ret).sum(axis=1).rename("MVO_daily")
-    return W_daily, pnl
+
+    # --- execution delay & trading costs ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+    
+    pnl_mvo, W_daily, _W_eff = pnl_with_delay_and_cost(
+        W_on_dates=W_rebal, full_index=df_px.index,
+        R_df=df_ret, delay=k_delay, tc=tc, name="MVO_daily",)
+
+    return W_daily, pnl_mvo
 
 def run_dro(df_px, df_ret, index_rebal, CONFIG, G, solve_dro, verbose=True):
     tickers = list(df_px.columns)
@@ -2378,9 +2427,16 @@ def run_dro(df_px, df_ret, index_rebal, CONFIG, G, solve_dro, verbose=True):
         rows.append(pd.Series(w, index=tickers, name=dt))
 
     W_rebal = pd.DataFrame(rows).sort_index()
-    W_daily = _expand_daily_weights(W_rebal, df_px.index)
-    pnl     = (W_daily * df_ret).sum(axis=1).rename("DRO_daily")
-    return W_daily, pnl
+    
+    # --- execution delay & trading costs ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+    
+    pnl_dro, W_daily, _W_eff = pnl_with_delay_and_cost(
+        W_on_dates=W_rebal, full_index=df_px.index,
+        R_df=df_ret, delay=k_delay, tc=tc, name="DRO_daily",)
+    
+    return W_daily, pnl_dro
 
 def run_regdro(df_px, df_ret, index_union, Z_labels, CONFIG, G, solve_dro, verbose=True):
     tickers = list(df_px.columns)
@@ -2417,7 +2473,7 @@ def run_regdro(df_px, df_ret, index_union, Z_labels, CONFIG, G, solve_dro, verbo
             if rows:
                 rows.append(rows[-1].rename(dt))
             else:
-                rows.append(pd.Series(np.zeros(len(tickers)), index=tickers, name=dt))
+                rows.append(pd.Series(_feasible_placeholder(len(tickers), G), index=tickers, name=dt))
             continue
 
         Rk  = pd.concat(cols, axis=1).reindex(columns=A_keep).fillna(0.0).to_numpy(float)
@@ -2430,11 +2486,63 @@ def run_regdro(df_px, df_ret, index_union, Z_labels, CONFIG, G, solve_dro, verbo
         rows.append(pd.Series(w_full, index=tickers, name=dt))
 
     W_union = pd.DataFrame(rows).sort_index()
-    W_daily = _expand_daily_weights(W_union, df_px.index)
-    pnl     = (W_daily * df_ret).sum(axis=1).rename("RegDRO_daily")
-    return W_daily, pnl
+    
+    # --- execution delay & trading costs ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
 
+    pnl_reg, W_daily, _W_eff = pnl_with_delay_and_cost(
+        W_on_dates=W_union, full_index=df_px.index, R_df=df_ret,
+        delay=k_delay, tc=tc, name="RegDRO_daily",)
+    
+    return W_daily, pnl_reg
 
+def _feasible_placeholder(N, G):
+    import numpy as _np
+    N = int(N)
+    # Default: all cash if we can't construct a simple feasible vector
+    if N <= 0:
+        return _np.zeros(0, dtype=float)
+
+    no_short = bool(G.get("no_shorting", False))
+    no_lev   = bool(G.get("no_leverage", False))
+    max_cash = G.get("max_cash", None)
+    cap      = G.get("max_pos_size", None)
+
+    if no_short and no_lev and (max_cash is not None):
+        s = max(0.0, 1.0 - float(max_cash))  # target invested weight sum
+        if s <= 0.0:
+            return _np.zeros(N, dtype=float)
+
+        if cap is None or not _np.isfinite(cap) or cap < 0.0:
+            # no cap provided → equal-weight
+            return _np.full(N, s / max(N, 1), dtype=float)
+
+        cap = float(cap)
+        # Try equal-weight under cap
+        per = min(cap, s / max(N, 1))
+        w = _np.full(N, per, dtype=float)
+        invested = float(w.sum())
+
+        # If per < s/N but cap binds, we may leave extra in cash (fine under no leverage).
+        # If we can still add without breaching cap, distribute remainder greedily.
+        rem = max(0.0, s - invested)
+        if rem > 0 and cap > 0:
+            for i in range(N):
+                if rem <= 0:
+                    break
+                add = min(cap - w[i], rem)
+                if add > 0:
+                    w[i] += add
+                    rem  -= add
+        return w
+
+    # Fallback: zeros (all cash)
+    return _np.zeros(N, dtype=float)
+
+def _period_ends(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
+    """Return last available date per period on `idx` (e.g., month-end on trading calendar)."""
+    return pd.DatetimeIndex(pd.Series(idx).groupby(idx.to_period(freq)).max())
 
 # -------------------------
 # Pipeline
@@ -2486,16 +2594,41 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     if not px_cols:
         raise RuntimeError("No securities left after intersecting with PX panel.")
     df_raw = px_all[px_cols].astype(float)
-
-    # returns panel (AGREED)
+    
+    # returns panel
     s = CONFIG["DATA"].get("start_dt")
     e = CONFIG["DATA"].get("end_dt")
-    df_raw_slice = df_raw.loc[s:e]
-    if df_raw_slice.shape[0] < 2:
-        raise RuntimeError("Not enough rows after slicing df_raw[start:end].")
-    df_returns = df_raw_slice.pct_change().fillna(0.0)
-    full_index = df_returns.index
+    
+    # --- extend history by max_lookback_days BEFORE start_dt for fitting ---
+    idx  = df_raw.index
+    s_dt = pd.to_datetime(s) if s is not None else idx[0]
+    e_dt = pd.to_datetime(e) if e is not None else idx[-1]
+    
+    i_start = idx.get_indexer([s_dt], method="nearest")[0]
+    i_end   = idx.get_indexer([e_dt], method="nearest")[0]
+    i_hist  = max(0, i_start - int(CONFIG["REBAL"]["max_lookback_days"]))
+    
+    # History for FITTING = [s_dt - max_lb, e_dt]
+    df_raw_slice_hist = df_raw.iloc[i_hist : i_end + 1]
+    if df_raw_slice_hist.shape[0] < 2:
+        raise RuntimeError("Not enough rows after slicing df_raw with pre-start history.")
+    
+    # Returns for FITTING (extended history)
+    df_returns_full = df_raw_slice_hist.pct_change().fillna(0.0)
+    full_index_fit  = df_returns_full.index
+    
+    # OOS evaluation window = strictly [start_dt, end_dt] on the FIT index
+    oos_index = full_index_fit[(full_index_fit >= s_dt) & (full_index_fit <= e_dt)]
+    if len(oos_index) == 0:
+        raise RuntimeError("Empty OOS index after applying [start_dt, end_dt].")
+    
+    # ---- define the canonical OOS panel & index used downstream ----
+    df_returns = df_returns_full              # keep full history available
+    full_index = oos_index                    # OOS index used for PnL/eval
 
+    # returns strictly on [start_dt, end_dt] for PnL
+    R_oos = df_returns_full.loc[full_index]   # already fillna(0.0) upstream
+    
     # SPX benchmark series (for table + relative stats)
     if "SPX" in px_all.columns:
         spx_daily = pd.to_numeric(px_all["SPX"], errors="coerce").loc[s:e].pct_change().fillna(0.0)
@@ -2505,33 +2638,60 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     # ===== MVO & DRO (rebalanced on intersection == full_index) =====
     k_days = int(CONFIG["REBAL"]["rebalance_period_days"])
     if k_days <= 0: raise ValueError("rebalance_period_days must be > 0.")
-    index_rebal, marks = make_index_rebal(full_index, s, e, k_days)
+    # marks on the FIT index (history included)
+    index_rebal, marks = make_index_rebal(full_index_fit, s, e, k_days)
 
     lam    = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
     min_lb = int(CONFIG["REBAL"]["min_lookback_days"])
     max_lb = int(CONFIG["REBAL"]["max_lookback_days"])
     AF     = int(CONFIG.get("annualization_factor", 252))
 
-    R_use = df_returns.copy()  # already 0-filled; same panel for both models
+    R_use = df_returns_full.copy()  # extended history for fitting
 
     # MVO (piecewise)
     fit_mvo = fit_mvo_rebalanced(R_use, G, AF, marks,
                                  min_lb=min_lb, max_lb=max_lb, lam_shr=lam,
                                  verbose=bool(verbose))
-    mvo_daily = pd.Series(
-        _port_series_from_fit(fit_mvo, R_use.to_numpy(float)),
-        index=full_index, name="MVO_daily"
-    )
+
+    # --- MVO: build weights-on-dates from piecewise fit, then apply unified PnL helper ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+
+    # keep only rebal dates >= start_dt so PnL respects the cash cap from day 1 of OOS
+    rebal_dates_fit = full_index_fit[marks[:-1]]
+    oos_start = oos_index[0]
+
+    mvo_rows = []
+    for dt, w in zip(rebal_dates_fit, fit_mvo["w_list"]):
+        if dt >= oos_start:
+            mvo_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+    W_rebal_mvo = pd.DataFrame(mvo_rows).sort_index()
+        
+    mvo_daily, W_daily_mvo, W_eff_mvo = pnl_with_delay_and_cost(
+        W_on_dates=W_rebal_mvo,
+        full_index=full_index, R_df=R_oos,
+        delay=k_delay, tc=tc, name="MVO_daily",)
 
     # DRO (piecewise)
     params_dro = dict(CONFIG["DELTA_DEFAULTS"][CONFIG["PORTFOLIO"]["delta_name"]])
     fit_dro_pw = fit_dro_rebalanced(R_use, params_dro, G, AF, marks,
                                     min_lb=min_lb, max_lb=max_lb, lam_shr=lam,
                                     verbose=bool(verbose))
-    dro_daily = pd.Series(
-        _port_series_from_fit(fit_dro_pw, R_use.to_numpy(float)),
-        index=full_index, name="DRO_daily"
-    )
+    
+    # --- DRO: build weights-on-dates from piecewise fit, then apply unified PnL helper ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+    
+    dro_rows = []
+    for dt, w in zip(rebal_dates_fit, fit_dro_pw["w_list"]):
+        if dt >= oos_start:
+            dro_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+    W_rebal_dro = pd.DataFrame(dro_rows).sort_index()
+        
+    dro_daily, W_daily_dro, W_eff_dro = pnl_with_delay_and_cost(
+        W_on_dates=W_rebal_dro,
+        full_index=full_index, R_df=R_oos,
+        delay=k_delay, tc=tc, name="DRO_daily",)
 
     # ===== Regime-DRO (piecewise on UNION) =====
     # labels via winning configs
@@ -2653,6 +2813,8 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     print(f"rSLDS macro-avg hit rate (per-asset): {macro_hr:.4f}")
 
     w_list = []; delta_list = []
+    skips_cap = 0
+    total_segments = len(taus) - 1
     for a, b in zip(taus[:-1], taus[1:]):
         t_mid = min(max(a, 0), len(full_index) - 1)
 
@@ -2660,8 +2822,10 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         A_k = [n for n in names_all
                if np.isfinite(Z_labels[n][t_mid]) and np.isfinite(df_returns[n].iloc[t_mid])]
         if not A_k:
-            w_list.append(np.zeros(len(names_all))); delta_list.append(np.nan); continue
-
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G)))
+            delta_list.append(np.nan)
+            continue
+    
         # regime-conditioned window [t0, t_mid]
         t0 = max(0, t_mid - lookback + 1)
         win_idx = full_index[t0:t_mid+1]
@@ -2680,17 +2844,34 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             if w_list:
                 w_list.append(w_list[-1])
             else:
-                w_list.append(np.zeros(len(names_all)))
+                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G)))
             delta_list.append(np.nan)
             continue
 
+        # --- CAP CHECK (print, forward-fill, and skip; do NOT crash) ---
+        c_max = float(CONFIG["PORTFOLIO"]["max_cash"])
+        u     = float(CONFIG["PORTFOLIO"]["max_pos_size"])
+        N_act = len(keep)
+        N_req = int(np.ceil((1.0 - c_max) / max(u, 1e-12)))
+        dt    = full_index[t_mid]
+        if (G.get("no_shorting", False)) and (N_act < N_req):
+            print(f"[CAP CHECK] date={pd.to_datetime(dt).date()}  N_act={N_act}  N_req={N_req}  -> skip & ffill")
+            # forward-fill weights; if none yet, drop to feasible placeholder
+            if w_list:
+                w_list.append(w_list[-1])
+            else:
+                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G)))
+            delta_list.append(np.nan)
+            skips_cap += 1
+            continue
+        
         Rk  = pd.concat(cols, axis=1).reindex(columns=keep).fillna(0.0).to_numpy(float)
         mu  = Rk.mean(axis=0) * AF
         Xc  = Rk - Rk.mean(0)
         Sig = (Xc.T @ Xc) / max(1, Rk.shape[0]-1)
         lam = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
         Sig = (1-lam)*Sig + lam*np.trace(Sig)/Sig.shape[0]*np.eye(Sig.shape[0])
-
+        
         w_sub, delta_k = solve_dro(mu, Sig, params_reg, G, R=Rk, verbose=False)
         w_full = np.zeros(len(names_all))
         for j, n in enumerate(keep): w_full[pos[n]] = w_sub[j]
@@ -2699,6 +2880,11 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         if verbose:
             print(f"[RegDRO] seg [{a},{b})  t_mid={t_mid}  eligible={keep}  delta_k={float(delta_k):.6g}")
 
+    # end-of-loop summary of skips
+    if total_segments > 0:
+        pct_skipped = 100.0 * skips_cap / total_segments
+        print(f"[CAP CHECK] skipped {skips_cap}/{total_segments} segments ({pct_skipped:.2f}%).")
+    
     fit_reg = {
         "type": "piecewise",
         "w_list": [np.asarray(w, float) for w in w_list],
@@ -2707,11 +2893,30 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         "delta_list": [float(d) if np.isfinite(d) else np.nan for d in delta_list],
     }
 
-    regdro_daily = pd.Series(
-        _port_series_from_fit(fit_reg, df_returns[names_all].to_numpy(float)),
-        index=full_index, name="RegDRO_daily"
-    )
+    # --- RegDRO: build weights-on-dates from union breaks, then apply unified PnL helper ---
+    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
+    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+    
+    R_reg  = df_returns.loc[full_index, names_all]
+    taus   = [int(x) for x in fit_reg["segs"]]
+    
+    reg_rows = []
+    for dt, w in zip(full_index[taus[:-1]], fit_reg["w_list"]):
+        reg_rows.append(pd.Series(np.asarray(w, float), index=names_all, name=dt))
+    W_on_dates_reg = pd.DataFrame(reg_rows).sort_index()
+    
+    regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(
+        W_on_dates=W_on_dates_reg,
+        full_index=full_index, R_df=R_reg,
+        delay=k_delay, tc=tc, name="RegDRO_daily",)
 
+    # report weights
+    me_idx = _period_ends(full_index, "M")
+    H_mvo = W_eff_mvo.reindex(me_idx).ffill().rename_axis("date")
+    H_dro = W_eff_dro.reindex(me_idx).ffill().rename_axis("date")
+    H_reg = W_eff_reg.reindex(me_idx).ffill().rename_axis("date")
+
+    
     # ===== OOS summaries (strict s:e window) =====
     def _summ_from_series(series, G, AF, n_days):
         x = series.to_numpy(float)
@@ -2730,14 +2935,14 @@ def dro_pipeline(securities, CONFIG, verbose=True):
 
     AF = int(CONFIG.get("annualization_factor", 252))
     n_aligned = len(full_index)
-
+    
     spx_daily = spx_daily.reindex(full_index).fillna(0.0)
-
+    
     summ_mvo  = _summ_from_series(mvo_daily, G, AF, n_aligned)
     summ_dro  = _summ_from_series(dro_daily, G, AF, n_aligned)
     summ_reg  = _summ_from_series(regdro_daily, G, AF, n_aligned)
     summ_spx  = _summ_from_series(spx_daily, G, AF, n_aligned)
-
+    
     def _bench_stats(port, bench, AF=252):
         ex = (port - bench).dropna()
         if ex.empty: return float("nan"), float("nan"), float("nan")
@@ -2745,39 +2950,44 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         te    = (AF ** 0.5) * ex.std(ddof=1)
         ir    = alpha / te if np.isfinite(te) and te != 0 else float("nan")
         return float(alpha), float(te), float(ir)
-
+    
     # add bench-relative stats
     rows_mvo = dict(summ_mvo)
     rows_dro = dict(summ_dro)
     rows_reg = dict(summ_reg)
     rows_spx = dict(summ_spx)
-
-    # Gross exposure averaged on the requested window length
+    
+    # --- FIX: average gross exposure over the OOS slice only (not the pre-start lookback) ---
+    # Map the OOS [start,end] back to the fit index coordinates to define a half-open window [a_oos, b_oos)
+    a_oos = full_index_fit.get_loc(full_index[0])
+    b_oos = full_index_fit.get_loc(full_index[-1]) + 1
+    win_oos = (a_oos, b_oos)
+    
     T_req = len(full_index)
-    rows_mvo["gross_exp"] = _gross_exp_on_window(fit_mvo,   T_req)
-    rows_dro["gross_exp"] = _gross_exp_on_window(fit_dro_pw, T_req)
-    rows_reg["gross_exp"] = _gross_exp_on_window(fit_reg,   T_req)
+    rows_mvo["gross_exp"] = _gross_exp_on_window(fit_mvo,    T_req, win=win_oos)
+    rows_dro["gross_exp"] = _gross_exp_on_window(fit_dro_pw, T_req, win=win_oos)
+    rows_reg["gross_exp"] = _gross_exp_on_window(fit_reg,    T_req)   # RegDRO already aligned to OOS
 
     # Hit rate (portfolio vs SPX): mean & std, CI
-    mvo_hr_mean, mvo_hr_std, _, mvo_ci_lo, mvo_ci_hi = hit_rate_vs_bench_stats(mvo_daily,  spx_daily, full_index)
-    dro_hr_mean, dro_hr_std, _, dro_ci_lo, dro_ci_hi = hit_rate_vs_bench_stats(dro_daily,  spx_daily, full_index)
-    reg_hr_mean, reg_hr_std, _, reg_ci_lo, reg_ci_hi = hit_rate_vs_bench_stats(regdro_daily, spx_daily, full_index)
-    
-    rows_mvo["hit_rate_vs_bench"]      = mvo_hr_mean
-    rows_mvo["hit_rate_vs_bench_std"]  = mvo_hr_std
+    mvo_hr_mean, mvo_hr_se, _, mvo_ci_lo, mvo_ci_hi = hit_rate_vs_bench_stats(mvo_daily,  spx_daily, full_index)
+    dro_hr_mean, dro_hr_se, _, dro_ci_lo, dro_ci_hi = hit_rate_vs_bench_stats(dro_daily,  spx_daily, full_index)
+    reg_hr_mean, reg_hr_se, _, reg_ci_lo, reg_ci_hi = hit_rate_vs_bench_stats(regdro_daily, spx_daily, full_index)
+
+    rows_mvo["hit_rate_vs_bench"]         = mvo_hr_mean
+    rows_mvo["hit_rate_vs_bench_se"]      = mvo_hr_se
     rows_mvo["hit_rate_vs_bench_ci_low"]  = mvo_ci_lo
     rows_mvo["hit_rate_vs_bench_ci_high"] = mvo_ci_hi
     
-    rows_dro["hit_rate_vs_bench"]      = dro_hr_mean
-    rows_dro["hit_rate_vs_bench_std"]  = dro_hr_std
+    rows_dro["hit_rate_vs_bench"]         = dro_hr_mean
+    rows_dro["hit_rate_vs_bench_se"]      = dro_hr_se
     rows_dro["hit_rate_vs_bench_ci_low"]  = dro_ci_lo
     rows_dro["hit_rate_vs_bench_ci_high"] = dro_ci_hi
     
-    rows_reg["hit_rate_vs_bench"]      = reg_hr_mean
-    rows_reg["hit_rate_vs_bench_std"]  = reg_hr_std
+    rows_reg["hit_rate_vs_bench"]         = reg_hr_mean
+    rows_reg["hit_rate_vs_bench_se"]      = reg_hr_se
     rows_reg["hit_rate_vs_bench_ci_low"]  = reg_ci_lo
     rows_reg["hit_rate_vs_bench_ci_high"] = reg_ci_hi
-
+    
     # Optional: SPX as its own model column in the OOS table
     # We already use SPX for alpha/TE/IR; this makes it visible as a column
     spx_on_win = spx_daily.reindex(full_index).fillna(0.0)
@@ -2865,11 +3075,11 @@ def dro_pipeline(securities, CONFIG, verbose=True):
         "rSLDS_hit_rate_ci_high": float(hr_ci_high),
         "rSLDS_hit_rate_n": int(hr_n),
         "rSLDS_hit_rate_macro": macro_hr,
-    },}
 
+        "holdings": {"MVO": H_mvo, "DRO": H_dro, "RegDRO": H_reg},
+    },}
 
     if "dro_pickle" in CONFIG and CONFIG["dro_pickle"]:
         save_out(out, CONFIG["dro_pickle"])
 
     return out
-
