@@ -321,7 +321,12 @@ def psd_factor_LtL(Sigma, eps):
         vals = xp.clip(vals, eps, None)
         Sigma_psd = vecs @ xp.diag(vals) @ vecs.T
         C = xp.linalg.cholesky(Sigma_psd)
-    return _np.asarray(C.T)   # ensure NumPy for CVXPY
+    # Explicit device→host copy when using CuPy; no-op for NumPy
+    asnumpy = getattr(xp, "asnumpy", None)
+    if callable(asnumpy):
+        return asnumpy(C.T).astype(_np.float64, copy=False)
+    else:
+        return _np.asarray(C.T, dtype=_np.float64)
 
 def _sigma_unconditional(
     R_df: pd.DataFrame,
