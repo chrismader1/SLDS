@@ -229,6 +229,17 @@ def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, block_len=10, eps=1e-9,
 # Optimization
 # ---------------------------------------------------------------
 
+def to_numpy(a, dtype=float):
+    """Return a NumPy array on host, even if `a` is a CuPy array."""
+    import numpy as _np
+    asnp = getattr(xp, "asnumpy", None)
+    if callable(asnp):
+        try:
+            return asnp(a).astype(dtype, copy=False)
+        except Exception:
+            pass
+    return _np.asarray(a, dtype=dtype)
+    
 def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
     
     """
@@ -464,8 +475,8 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         raise RuntimeError(f"ECOS/MOSEK failed: status={prob.status}")
 
-    return xp.asarray(_np.asarray(w.value).reshape(-1))
-
+    # Always return NumPy on host to avoid CuPy→NumPy implicit conversion errors downstream
+    return _np.asarray(w.value, dtype=float).reshape(-1)
 
 # ---------------------------------------------------------------
 # Fitting - Actual Data
@@ -1615,16 +1626,16 @@ def _gross_exp_on_window(fit, T_req, win=None):
     """Average gross exposure over a reporting window of length T_req (optionally [a,b) slice)."""
     import numpy as _np
     if fit["type"] == "static":
-        return float(_np.sum(_np.abs(fit["w"])))
+        return float(_np.sum(_np.abs(to_numpy(fit["w"], float))))
     segs = [int(x) for x in fit["segs"]]
     a0, b0 = (0, 10**12) if win is None else (int(win[0]), int(win[1]))
     num = 0.0
     for (a, b), w in zip(zip(segs[:-1], segs[1:]), fit["w_list"]):
         L = max(0, min(b, b0) - max(a, a0))
         if L > 0:
-            num += L * float(_np.sum(_np.abs(w)))
+            num += L * float(_np.sum(_np.abs(to_numpy(w, float))))
     return num / max(T_req, 1)
-    
+
 def make_index_rebal(
     intersection_index: pd.DatetimeIndex,
     start_dt: str | None,
@@ -1928,7 +1939,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     mvo_rows = []
     for dt, w in zip(rebal_dates_fit, fit_mvo["w_list"]):
         if dt >= oos_start:
-            mvo_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+            mvo_rows.append(pd.Series(to_numpy(w, float), index=R_use.columns, name=dt))
     W_rebal_mvo = pd.DataFrame(mvo_rows).sort_index()
         
     mvo_daily, W_daily_mvo, W_eff_mvo = pnl_with_delay_and_cost(
@@ -1949,7 +1960,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     dro_rows = []
     for dt, w in zip(rebal_dates_fit, fit_dro_pw["w_list"]):
         if dt >= oos_start:
-            dro_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+            dro_rows.append(pd.Series(to_numpy(w, float), index=R_use.columns, name=dt))
     W_rebal_dro = pd.DataFrame(dro_rows).sort_index()
         
     dro_daily, W_daily_dro, W_eff_dro = pnl_with_delay_and_cost(
@@ -2234,7 +2245,8 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     
     reg_rows = []
     for dt, w in zip(full_index[taus[:-1]], fit_reg["w_list"]):
-        reg_rows.append(pd.Series(np.asarray(w, float), index=names_all, name=dt))
+        reg_rows.append(pd.Series(to_numpy(w, float), index=names_all, name=dt))
+        
     W_on_dates_reg = pd.DataFrame(reg_rows).sort_index()
     
     regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(
