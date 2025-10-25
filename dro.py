@@ -892,10 +892,15 @@ def stats_from_series(port_daily, config):
     rf_annual = config["risk_free_rate"]
     AF = int(config.get("annualization_factor", 252))
     rf_daily = (1 + rf_annual) ** (1 / AF) - 1
-    sigma_daily = xp.std(port_daily, ddof=1)
+    x = xp.asarray(port_daily, dtype=float).reshape(-1)
+    mask = xp.isfinite(x)
+    x = x[mask]
+    if x.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    sigma_daily = xp.std(x, ddof=1)
     sigma_annual = sigma_daily * xp.sqrt(AF)
-    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(port_daily))) - 1
-    sharpe_annual = (xp.mean(port_daily) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
+    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(x))) - 1
+    sharpe_annual = (xp.mean(x) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
     return float(mu_annual_geom), float(sigma_annual), float(sharpe_annual)
 
 def _max_drawdown_from_series(port_daily):
