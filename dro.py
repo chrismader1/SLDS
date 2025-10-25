@@ -905,16 +905,26 @@ def stats_from_series(port_daily, config):
 
 def _max_drawdown_from_series(port_daily):
     """
-    Max drawdown of a daily-return series.
-    Returns the minimum (most negative) drawdown, e.g. -0.27 for -27%.
+    Max drawdown (most negative) from daily simple returns.
+    Uses device ops for prod; does cummax on host when GPU=True (CuPy lacks accumulate).
     """
-    x = xp.asarray(port_daily, float)
+    import numpy as _np
+    x = xp.asarray(port_daily, float).reshape(-1)
     if x.size == 0:
         return float("nan")
+
+    # equity curve on current backend
     equity = xp.cumprod(1.0 + x)
-    peak = xp.maximum.accumulate(equity)
-    dd = equity / peak - 1.0
-    return float(xp.min(dd))
+
+    if GPU and hasattr(xp, "asnumpy"):  # CuPy path: cummax on host
+        eq_h   = xp.asnumpy(equity)
+        peak_h = _np.maximum.accumulate(eq_h)
+        dd_h   = eq_h / peak_h - 1.0
+        return float(_np.min(dd_h))
+    else:                               # NumPy path: pure xp (xp==np)
+        peak = xp.maximum.accumulate(equity)
+        dd   = equity / peak - 1.0
+        return float(xp.min(dd))
 
 def portfolio_stats(weights, returns, config):
     """Static weights over full horizon."""
