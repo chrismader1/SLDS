@@ -2071,8 +2071,8 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     ).astype(int)
     
     # (d) Save once to CSV (no config entry)
-    # signals_csv_path = "signals_table.csv"
-    # signals_fit.to_csv(signals_csv_path, index_label="date")
+    signals_csv_path = "signals_table.csv"
+    signals_fit.to_csv(signals_csv_path, index_label="date")
     
     # (e) OOS subset & sparse on-dates (for display/diagnostics)
     signals_fit_oos = signals_fit.loc[full_index, names_all]
