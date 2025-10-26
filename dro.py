@@ -1834,6 +1834,130 @@ def _period_ends(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
     """Return last available date per period on `idx` (e.g., month-end on trading calendar)."""
     return pd.DatetimeIndex(pd.Series(idx).groupby(idx.to_period(freq)).max())
 
+def _nested_bootstrap_piecewise_mvo_dro(
+    R_full: pd.DataFrame,
+    *,
+    marks: list[int],           # rebal marks on FIT calendar (incl 0 and T_fit)
+    a_oos: int,                 # start pos on FIT calendar for OOS slice
+    b_oos: int,                 # end-exclusive pos on FIT calendar for OOS slice
+    AF: int,
+    min_lb: int,
+    max_lb: int,
+    lam_shr: float,
+    G: dict,
+    params_dro: dict | None,    # None => MVO, else DRO params
+    delay: int,
+    tc: float,
+    B: int,
+    avg_block: int,
+    alpha: float,
+    seed=None,
+):
+    """
+    Stationary block nested bootstrap for piecewise MVO/DRO:
+      • resample FIT-length paths;
+      • re-optimize at each rebal mark using bootstrapped window;
+      • evaluate on OOS slice [a_oos:b_oos).
+    Bench-relative metrics set to NaN (no bootstrapped SPX path here).
+    """
+    import numpy as _np
+    _rng = _np.random.default_rng(seed)
+
+    X_fit = R_full.to_numpy(float, copy=False)          # (T_fit, N)
+    cols  = list(R_full.columns)
+    T_fit, N = X_fit.shape
+    T_oos = int(b_oos - a_oos)
+    if T_oos <= 0:
+        raise ValueError("OOS slice must be non-empty.")
+
+    idx_mat = _stationary_bootstrap_indices(T_fit, max(int(B), 1), int(avg_block), rng=_rng)
+
+    keys = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
+            "alpha_ann","te_ann","ir_ann","hit_rate"]
+    coll = {k: [] for k in keys}
+
+    for b in range(int(B)):
+        idx = idx_mat[b]
+        Rb  = X_fit[idx, :]                      # FIT-length
+        Rb_oos = Rb[a_oos:b_oos, :]              # OOS slice, length T_oos
+
+        # Re-optimize on bootstrapped path at each rebal decision
+        w_list = []
+        pos_list = []
+        for a in marks[:-1]:
+            if a < a_oos or a >= b_oos:
+                continue  # decisions outside OOS slice don't affect OOS PnL
+            ws = _window_start(a, min_lb, max_lb)
+            X_win = Rb[ws:a, :]
+            if X_win.shape[0] < max(2, min_lb):
+                # carry forward previous if exists, else zeros
+                w_list.append(w_list[-1] if w_list else np.zeros(N, float))
+                pos_list.append(a)
+                continue
+
+            # compute μ, Σ on window (simple returns → annualize)
+            X_win_df = pd.DataFrame(X_win, columns=cols)
+            mask_all = np.ones(X_win_df.shape[0], dtype=bool)
+            mu_ann = compute_mean_from_window(X_win_df, mask_all, min_obs=min_lb, ann=AF)
+            Sig_ann = compute_cov_from_window(X_win_df, ann=AF, shrink_lambda=lam_shr, min_obs=min_lb)
+
+            # delta and solve
+            if params_dro is None:
+                delta = 0.0
+            else:
+                params_k = dict(params_dro)
+                params_k["n_ref"] = X_win_df.shape[0]
+                delta = compute_delta(params_k.get("kappa", 1.0),
+                                      mu_ann, Sig_ann,
+                                      R=X_win_df.to_numpy(float),
+                                      params=params_k)
+            w_k = solve_optimizer(mu_ann, Sig_ann, float(delta), G, verbose=False)
+            w_list.append(w_k); pos_list.append(a)
+
+        # Build OOS PnL on synthetic index 0..T_oos-1
+        if w_list:
+            # map FIT positions within [a_oos, b_oos) to 0..T_oos-1
+            rows = []
+            for p, w in zip(pos_list, w_list):
+                rows.append(pd.Series(np.asarray(w, float), index=cols, name=int(p - a_oos)))
+            W_on_dates = pd.DataFrame(rows).sort_index()
+        else:
+            # no rebal inside OOS slice → all cash
+            W_on_dates = pd.DataFrame([pd.Series(np.zeros(N), index=cols, name=0)])
+
+        idx_boot = pd.RangeIndex(T_oos)
+        R_df_boot = pd.DataFrame(Rb_oos, index=idx_boot, columns=cols)
+        port_series, _, _ = pnl_with_delay_and_cost(
+            W_on_dates=W_on_dates, full_index=idx_boot, R_df=R_df_boot,
+            delay=int(delay), tc=float(tc), name="piecewise_daily*"
+        )
+
+        # Metrics
+        x = port_series.to_numpy(float)
+        mu, sig, sh = stats_from_series(x, {"n_days": x.size, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
+        coll["mu_ann"].append(mu)
+        coll["sigma_ann"].append(sig)
+        coll["sharpe_ann"].append(sh)
+        coll["vol_breach"].append(max(sig - G["risk_budget"], 0.0))
+        coll["max_dd"].append(_max_drawdown_from_series(x))
+        # Bench-relative not computed in nested piecewise for MVO/DRO
+        for k in ("alpha_ann","te_ann","ir_ann","hit_rate"):
+            coll[k].append(_np.nan)
+
+    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
+    out = {}
+    for k, vals in coll.items():
+        arr = np.asarray(vals, float)
+        if arr.size == 0 or not np.isfinite(arr).any():
+            out[k] = {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
+        else:
+            out[k] = {
+                "mean": float(np.nanmean(arr)),
+                "ci_low": float(np.nanquantile(arr, lo_q)),
+                "ci_high": float(np.nanquantile(arr, hi_q)),
+            }
+    return out
+
 def nested_bootstrap_regdro(
     R_full: pd.DataFrame,
     signals_fit: pd.DataFrame,
@@ -2528,12 +2652,55 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     L_block  = int(CONFIG.get("BOOTSTRAP", {}).get("avg_block", 10))
     alpha_ci = float(CONFIG.get("BOOTSTRAP", {}).get("alpha", 0.05))
     seed_bs  = CONFIG.get("BOOTSTRAP", {}).get("seed", None)
-
-    bb_mvo = block_bootstrap_oos(mvo_daily,    spx_daily, G, AF, B=B_boot, avg_block=L_block, alpha=alpha_ci, seed=seed_bs)
-    bb_dro = block_bootstrap_oos(dro_daily,    spx_daily, G, AF, B=B_boot, avg_block=L_block, alpha=alpha_ci, seed=seed_bs)
+    run_bs   = bool(CONFIG.get("BOOTSTRAP", {}).get("run_bootstrap", False))
     
-    # Nested bootstrap for RegDRO when B>1, else fall back to single-pass stats
-    if CONFIG["BOOTSTRAP"]["run_bootstrap"]:
+    if run_bs:
+        # positions of the strict OOS slice on the FIT index
+        a_oos = full_index_fit.get_loc(full_index[0])
+        b_oos = full_index_fit.get_loc(full_index[-1]) + 1
+    
+        # MVO nested bootstrap (re-opt at rebal marks on bootstrapped paths)
+        bb_mvo = _nested_bootstrap_piecewise_mvo_dro(
+            R_full=df_returns_full[px_cols],
+            marks=marks,
+            a_oos=a_oos,
+            b_oos=b_oos,
+            AF=AF,
+            min_lb=min_lb,
+            max_lb=max_lb,
+            lam_shr=lam,
+            G=G,
+            params_dro=None,   # MVO
+            delay=k_delay,
+            tc=tc,
+            B=int(B_boot),
+            avg_block=int(L_block),
+            alpha=float(alpha_ci),
+            seed=seed_bs,
+        )
+    
+        # DRO nested bootstrap
+        params_dro_for_bs = dict(params_dro)  # same params as used above
+        bb_dro = _nested_bootstrap_piecewise_mvo_dro(
+            R_full=df_returns_full[px_cols],
+            marks=marks,
+            a_oos=a_oos,
+            b_oos=b_oos,
+            AF=AF,
+            min_lb=min_lb,
+            max_lb=max_lb,
+            lam_shr=lam,
+            G=G,
+            params_dro=params_dro_for_bs,  # DRO
+            delay=k_delay,
+            tc=tc,
+            B=int(B_boot),
+            avg_block=int(L_block),
+            alpha=float(alpha_ci),
+            seed=seed_bs,
+        )
+    
+        # RegDRO nested bootstrap (already nested)
         bb_reg = nested_bootstrap_regdro(
             R_full=df_returns_full,               # FIT-length returns matrix
             signals_fit=signals_fit,              # dense signals on FIT calendar
@@ -2551,15 +2718,22 @@ def dro_pipeline(securities, CONFIG, verbose=True):
             seed=seed_bs,
         )
     else:
-        bb_reg = {"mu_ann": {"mean": rows_reg["mu_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                  "sigma_ann": {"mean": rows_reg["sigma_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                  "sharpe_ann": {"mean": rows_reg["sharpe_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                  "vol_breach": {"mean": rows_reg["vol_breach"], "ci_low": np.nan, "ci_high": np.nan},
-                  "max_dd": {"mean": rows_reg["max_dd"], "ci_low": np.nan, "ci_high": np.nan},
-                  "alpha_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                  "te_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                  "ir_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                  "hit_rate": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan}}
+        # no bootstrap: attach NaN CIs and keep point estimates only
+        def _no_ci(rows):
+            return {
+                "mu_ann": {"mean": rows["mu_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                "sigma_ann": {"mean": rows["sigma_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                "sharpe_ann": {"mean": rows["sharpe_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                "vol_breach": {"mean": rows["vol_breach"], "ci_low": np.nan, "ci_high": np.nan},
+                "max_dd": {"mean": rows["max_dd"], "ci_low": np.nan, "ci_high": np.nan},
+                "alpha_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                "te_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                "ir_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                "hit_rate": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+            }
+        bb_mvo = _no_ci(rows_mvo)
+        bb_dro = _no_ci(rows_dro)
+        bb_reg = _no_ci(rows_reg)
     # NOTE: no SPX bootstrap — we never attach *_ci_* to SPX
 
     def _apply_bb(rows: dict, bb: dict):
