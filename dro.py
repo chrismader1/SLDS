@@ -179,9 +179,9 @@ def _mbb_indices(T: int, m: int, L: int, rng=None) -> np.ndarray:
         filled += k
     return idx
 
-def bootstrap_np_block_delta(R, n_proj=128, B=256, block_len=10, alpha=0.05, seed=None):
+def bootstrap_np_block_delta(R, n_proj=128, B=256, avg_block=10, alpha=0.05, seed=None):
     """
-    10-day moving-block bootstrap of the empirical daily panel.
+    Moving-block bootstrap of the empirical daily panel.
     Per replicate: draw TWO independent block-resamples of length n,
     compute sliced-W2 between them -> daily distance. Return (1-alpha) quantile.
     """
@@ -191,16 +191,16 @@ def bootstrap_np_block_delta(R, n_proj=128, B=256, block_len=10, alpha=0.05, see
     rng = np.random.default_rng(seed)
     dists = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        i1 = _mbb_indices(T, n, block_len, rng=rng)
-        i2 = _mbb_indices(T, n, block_len, rng=rng)
+        i1 = _mbb_indices(T, n, int(avg_block), rng=rng)
+        i2 = _mbb_indices(T, n, int(avg_block), rng=rng)
         X1 = R_xp[xp.asarray(i1, dtype=xp.int64)]
         X2 = R_xp[xp.asarray(i2, dtype=xp.int64)]
         dists[b] = sliced_w2_empirical(X1, X2, n_proj=n_proj, rng=None)
     return float(xp.quantile(dists, 1.0 - alpha))
 
-def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, block_len=10, eps=1e-9, seed=None):
+def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, avg_block=10, eps=1e-9, seed=None):
     """
-    10-day moving-block bootstrap, but distance is Gelbrich W2 between the
+    Moving-block bootstrap, but distance is Gelbrich W2 between the
     Gaussian fitted to the original sample (mu0,S0) and the Gaussian fitted to
     each block-resampled sample (mu_b,S_b). Returns daily (not annualized) delta.
     """
@@ -217,7 +217,7 @@ def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, block_len=10, eps=1e-9,
     rng = np.random.default_rng(seed)
     deltas = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        idx = _mbb_indices(n, n, block_len, rng=rng)
+        idx = _mbb_indices(n, n, int(avg_block), rng=rng)
         Xb  = X[xp.asarray(idx, dtype=xp.int64)]
         mub = xp.mean(Xb, axis=0)
         Xbc = Xb - mub
@@ -300,8 +300,8 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         B      = int((params or {}).get("B", 256))
         n_proj = int((params or {}).get("n_proj", 128))
         seed   = (params or {}).get("seed", None)
-        L      = int((params or {}).get("block_len", 10))  # fixed 10 by default
-        delta_daily = bootstrap_np_block_delta(R, n_proj=n_proj, B=B, block_len=L, alpha=alpha, seed=seed)
+        L      = int((params or {}).get("avg_block", 10))
+        delta_daily = bootstrap_np_block_delta(R, n_proj=n_proj, B=B, avg_block=L, alpha=alpha, seed=seed)
         return AF * float(delta_daily)
     
     if method == "bootstrap_gaussian":
@@ -310,8 +310,8 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         B     = int((params or {}).get("B", 512))
         eps   = float((params or {}).get("epsilon_sigma", 1e-9))
         seed  = (params or {}).get("seed", None)
-        L     = int((params or {}).get("block_len", 10))  # fixed 10 by default
-        delta_daily = bootstrap_gaussian_block_delta(R, alpha=alpha, B=B, block_len=L, eps=eps, seed=seed)
+        L     = int((params or {}).get("avg_block", 10))
+        delta_daily = bootstrap_gaussian_block_delta(R, alpha=alpha, B=B, avg_block=L, eps=eps, seed=seed)
         return AF * float(delta_daily)
     
     raise ValueError(f"Unknown delta_method='{method}'")
@@ -1834,6 +1834,170 @@ def _period_ends(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
     """Return last available date per period on `idx` (e.g., month-end on trading calendar)."""
     return pd.DatetimeIndex(pd.Series(idx).groupby(idx.to_period(freq)).max())
 
+def nested_bootstrap_regdro(
+    R_full: pd.DataFrame,
+    signals_fit: pd.DataFrame,
+    names_all: list[str],
+    *,
+    AF: int,
+    lookback: int,
+    min_obs: int,
+    params_reg: dict,
+    G: dict,
+    delay: int,
+    tc: float,
+    B: int,
+    avg_block: int,
+    alpha: float,
+    seed=None,
+):
+    """
+    Nested stationary block bootstrap for RegDRO:
+    resample FIT-length paths, rebuild regime breaks, re-optimize per break,
+    then evaluate OOS metrics on the last T_oos days of each bootstrapped path.
+    Returns dict of {metric: {mean, ci_low, ci_high}} like block_bootstrap_oos.
+    """
+    import numpy as _np
+    _rng = _np.random.default_rng(seed)
+
+    # host arrays (FIT window)
+    R_fit = R_full[names_all].to_numpy(float, copy=False)              # (T_fit, N)
+    S_fit = signals_fit[names_all].to_numpy(int, copy=False)           # (T_fit, N)
+    T_fit, N = R_fit.shape
+    T_oos = int(S_fit.shape[0] - (T_fit - S_fit.shape[0])) if S_fit.shape[0] <= T_fit else S_fit.shape[0]
+    # Use the last |OOS| days for evaluation in each replicate
+    T_oos = len(signals_fit.index.intersection(R_full.index))
+
+    # if no explicit OOS length provided via intersection, default to last 252 trading days
+    if T_oos <= 0 or T_oos > T_fit:
+        T_oos = min(252, T_fit)
+
+    # Pre-build bootstrap indices on FIT length
+    idx_mat = _stationary_bootstrap_indices(T_fit, max(int(B), 1), int(avg_block), rng=_rng)
+
+    keys = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
+            "alpha_ann","te_ann","ir_ann","hit_rate"]
+    coll = {k: [] for k in keys}
+
+    # fast helpers that mirror existing pipeline pieces
+    def _make_rows_from_port(series_vals):
+        x = _np.asarray(series_vals, float)
+        mu, sig, sh = stats_from_series(x, {"n_days": x.size, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
+        return {
+            "mu_ann": mu,
+            "sigma_ann": sig,
+            "sharpe_ann": sh,
+            "vol_breach": max(sig - G["risk_budget"], 0.0),
+            "max_dd": _max_drawdown_from_series(x),
+        }
+
+    def _bench_rel(port, bench):
+        ex = port - bench
+        ex = ex[_np.isfinite(ex)]
+        if ex.size == 0:
+            return _np.nan, _np.nan, _np.nan, _np.nan
+        alpha = AF * float(ex.mean())
+        te    = (AF ** 0.5) * float(ex.std(ddof=1))
+        ir    = alpha / te if _np.isfinite(te) and te != 0 else _np.nan
+        hr    = float((ex >= 0.0).mean())
+        return alpha, te, ir, hr
+
+    # Bootstrap loop
+    for b in range(max(int(B), 1)):
+        idx = idx_mat[b]                                        # length T_fit
+        Rb = R_fit[idx, :]                                      # (T_fit, N)
+        Sb = S_fit[idx, :]                                      # (T_fit, N)
+
+        # OOS slice = last T_oos rows
+        Rb_oos = Rb[-T_oos:, :]                                 # (T_oos, N)
+        Sb_oos = Sb[-T_oos:, :].astype(int)
+
+        # Regime union breaks on bootstrapped path
+        chg_any = (np.diff(Sb_oos, axis=0) != 0).any(axis=1)
+        taus = [0] + (np.where(chg_any)[0].astype(int) + 1).tolist() + [T_oos]
+
+        # Walk forward and re-optimize
+        w_list = []
+        for a, c in zip(taus[:-1], taus[1:]):
+            t_dec = max(a, 0)                                   # decision at segment start
+            active = [j for j in range(N) if Sb_oos[t_dec, j] == 1 and np.isfinite(Rb_oos[t_dec, j])]
+            if len(active) == 0:
+                w_list.append(np.zeros(N, dtype=float)); continue
+
+            a_win = max(0, t_dec - int(lookback)); b_win = t_dec
+            X_win = Rb_oos[a_win:b_win, :][:, active]           # window matrix
+            if X_win.shape[0] < min_obs:
+                w_list.append(np.zeros(N, dtype=float)); continue
+
+            # per-asset masks from signals in the window
+            masks = []
+            for j in active:
+                mj = (Sb_oos[a_win:b_win, j] == 1)
+                masks.append(mj)
+
+            # compute μ, Σ on window
+            cols = [names_all[j] for j in active]
+            X_win_df = pd.DataFrame(X_win, columns=cols)
+            mu_vals = []
+            ok_keep = []
+            ok_masks = []
+            for jj, col in enumerate(cols):
+                m = masks[jj]
+                try:
+                    mu_j = compute_mean_from_window(X_win_df[[col]], m, min_obs=min_obs, ann=AF)[0]
+                    mu_vals.append(float(mu_j)); ok_keep.append(col); ok_masks.append(m)
+                except Exception:
+                    pass
+            if not ok_keep:
+                w_list.append(np.zeros(N, dtype=float)); continue
+            mu_vec = np.asarray(mu_vals, float)
+            Sig_ann = compute_cov_from_window(X_win_df[ok_keep], ann=AF, shrink_lambda=float(G.get("sigma_shrinkage_lambda", 0.0)), min_obs=min_obs)
+            # delta and solve
+            X_src = X_win_df[ok_keep].to_numpy(float)
+            params_k = dict(params_reg)
+            params_k["n_ref"] = X_src.shape[0]
+            delta_k = compute_delta(params_k.get("kappa", 1.0), mu_vec, Sig_ann, R=X_src, params=params_k)
+            w_sub = solve_optimizer(mu_vec, Sig_ann, delta_k, G, verbose=False)
+
+            # map back to N
+            w_full = np.zeros(N, dtype=float)
+            for jj, col in enumerate(ok_keep):
+                j_idx = names_all.index(col)
+                w_full[j_idx] = w_sub[jj]
+            w_list.append(w_full)
+
+        # Build daily PnL with delay and costs on synthetic index
+        idx_boot = pd.RangeIndex(T_oos)
+        R_df_boot = pd.DataFrame(Rb_oos, index=idx_boot, columns=names_all)
+        rows = []
+        for pos, w in zip([t for t in taus[:-1]], w_list):
+            rows.append(pd.Series(w, index=names_all, name=pos))
+        W_on_dates = pd.DataFrame(rows).sort_index()
+        port_series, _, _ = pnl_with_delay_and_cost(W_on_dates, idx_boot, R_df_boot, delay=int(delay), tc=float(tc), name="RegDRO_daily*")
+
+        # Metrics
+        rows_b = _make_rows_from_port(port_series.to_numpy(float))
+        # no benchmark series in this nested call; set bench-relative to NaN
+        rows_b["alpha_ann"], rows_b["te_ann"], rows_b["ir_ann"], rows_b["hit_rate"] = (np.nan, np.nan, np.nan, np.nan)
+
+        for k in keys:
+            coll[k].append(rows_b[k])
+
+    # Summarize
+    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
+    out = {}
+    for k, vals in coll.items():
+        arr = _np.asarray(vals, float)
+        if arr.size == 0 or not _np.isfinite(arr).any():
+            out[k] = {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
+        else:
+            out[k] = {
+                "mean": float(_np.nanmean(arr)),
+                "ci_low": float(_np.nanquantile(arr, lo_q)),
+                "ci_high": float(_np.nanquantile(arr, hi_q)),
+            }
+    return out
+
 # -------------------------
 # Pipeline
 # -------------------------
@@ -2367,7 +2531,35 @@ def dro_pipeline(securities, CONFIG, verbose=True):
 
     bb_mvo = block_bootstrap_oos(mvo_daily,    spx_daily, G, AF, B=B_boot, avg_block=L_block, alpha=alpha_ci, seed=seed_bs)
     bb_dro = block_bootstrap_oos(dro_daily,    spx_daily, G, AF, B=B_boot, avg_block=L_block, alpha=alpha_ci, seed=seed_bs)
-    bb_reg = block_bootstrap_oos(regdro_daily, spx_daily, G, AF, B=B_boot, avg_block=L_block, alpha=alpha_ci, seed=seed_bs)
+    
+    # Nested bootstrap for RegDRO when B>1, else fall back to single-pass stats
+    if CONFIG["BOOTSTRAP"]["run_bootstrap"]:
+        bb_reg = nested_bootstrap_regdro(
+            R_full=df_returns_full,               # FIT-length returns matrix
+            signals_fit=signals_fit,              # dense signals on FIT calendar
+            names_all=names_all,
+            AF=AF,
+            lookback=lookback,
+            min_obs=min_obs,
+            params_reg=params_reg,
+            G=G,
+            delay=k_delay,
+            tc=tc,
+            B=int(B_boot),
+            avg_block=int(L_block),
+            alpha=float(alpha_ci),
+            seed=seed_bs,
+        )
+    else:
+        bb_reg = {"mu_ann": {"mean": rows_reg["mu_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                  "sigma_ann": {"mean": rows_reg["sigma_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                  "sharpe_ann": {"mean": rows_reg["sharpe_ann"], "ci_low": np.nan, "ci_high": np.nan},
+                  "vol_breach": {"mean": rows_reg["vol_breach"], "ci_low": np.nan, "ci_high": np.nan},
+                  "max_dd": {"mean": rows_reg["max_dd"], "ci_low": np.nan, "ci_high": np.nan},
+                  "alpha_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                  "te_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                  "ir_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
+                  "hit_rate": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan}}
     # NOTE: no SPX bootstrap — we never attach *_ci_* to SPX
 
     def _apply_bb(rows: dict, bb: dict):
