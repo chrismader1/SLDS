@@ -1136,6 +1136,20 @@ def _aggregate_ci_xp(samples: dict[str, list[float]], alpha: float) -> dict[str,
             }
     return out
 
+def _aggregate_mean_std(samples: dict[str, list[float]]) -> dict[str, dict]:
+    out = {}
+    for k, vals in samples.items():
+        arr = np.asarray(vals, float)
+        good = arr[np.isfinite(arr)]
+        if good.size == 0:
+            out[k] = {"mean": np.nan, "std": np.nan}
+        else:
+            out[k] = {
+                "mean": float(np.mean(good)),
+                "std":  float(np.std(good, ddof=1)) if good.size > 1 else np.nan,
+            }
+    return out
+
 def bootstrap_universe_oos(
     *,
     securities: list[str],
@@ -1148,21 +1162,23 @@ def bootstrap_universe_oos(
     """
     GPU-accelerated subset sampling + CI aggregation.
     Pipeline run remains CPU-bound; I/O removed via artifacts cache.
+    Also returns bootstrap mean and std for each metric.
     """
-    # cache once
     artifacts = _load_artifacts_cached(CONFIG)
+
+    # mark bootstrap context for dro_pipeline printing control
+    CONFIG["__bootstrap_run"] = {"active": True, "B": int(B), "i": 0}
 
     names = [str(x) for x in securities]
     n = int(len(names))
     m = int(max(1, xp.floor(float(p) * n)))
 
-    # Pre-generate B subsets on device: argsort of random matrix gives random permutations
-    rs = None
+    # pre-generate B subsets
     if GPU:
         xp.random.seed(seed if seed is not None else 0)
         R = xp.random.random((int(B), n))
         perm = xp.argsort(R, axis=1)
-        subs = perm[:, :m]                              # (B,m) int64 on device
+        subs = perm[:, :m]  # (B,m)
     else:
         rng = np.random.default_rng(seed)
         subs = np.vstack([rng.permutation(n)[:m] for _ in range(int(B))])
@@ -1174,19 +1190,39 @@ def bootstrap_universe_oos(
     ]
     buckets = {s: {k: [] for k in METRICS} for s in ("MVO","DRO","RegDRO")}
 
-    # Run pipeline per subset (still serial and CPU). No nested bootstrap inside.
     for b in range(int(B)):
-        idx_b = subs[b].get() if GPU else subs[b]       # host indices
+        idx_b = subs[b].get() if GPU else subs[b]
         subset = [names[int(i)] for i in idx_b]
-        res = dro_pipeline(subset, CONFIG, verbose=False, run_bootstrap=False, artifacts=artifacts)
+
+        # progress print per run
+        print()
+        print(72*"=")
+        print(f"[bootstrap] run {b+1}/{B}, subset={len(subset)}")
+        print(72*"=")
+        print()
+
+        CONFIG["__bootstrap_run"]["i"] = int(b)
+        res = dro_pipeline(
+            subset,
+            CONFIG,
+            verbose=False,
+            run_bootstrap=False,   # avoid recursion
+            artifacts=artifacts,
+        )
         for strat in ("MVO","DRO","RegDRO"):
             row = res[strat]["summary"]
             for k in METRICS:
                 buckets[strat][k].append(float(row.get(k, np.nan)))
 
-    # CI on GPU
-    out = {s: _aggregate_ci_xp(buckets[s], alpha) for s in buckets}
-    return out
+    # cleanup context
+    CONFIG.pop("__bootstrap_run", None)
+
+    # percentile CIs
+    ci = {s: _aggregate_ci_xp(buckets[s], alpha) for s in buckets}
+    # mean/std across runs
+    ms = {s: _aggregate_mean_std(buckets[s]) for s in buckets}
+
+    return {"ci": ci, "mean_std": ms}
 
 # ---------------------------------------------------------------
 # Reporting
@@ -1817,35 +1853,11 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
       • SPX included in OOS summary table
     """
 
-    '''
-    G = _make_solver_cfg_from_CONFIG(CONFIG)
-
-    # ----- artifacts -----
-    res_csv  = CONFIG["results_csv"]
-    seg_parq = CONFIG["segments_parquet"]
-    if not os.path.exists(res_csv):  raise FileNotFoundError(res_csv)
-    if not os.path.exists(seg_parq): raise FileNotFoundError(seg_parq)
-
-    df_res  = pd.read_csv(res_csv, usecols=range(10), engine="python")
-    df_res["security"] = df_res["security"].astype(str).str.strip()
-
-    # securities list from results (or validate provided)
-    if securities is None:
-        securities = sorted(df_res["security"].unique())
-    else:
-        req = set(map(str, securities)); have = set(df_res["security"].unique())
-        missing = sorted(req - have)
-        assert not missing, f"[gridsearch check] Missing in results CSV: {', '.join(missing)}"
-
-    # parquet presence
-    seg_hdr = pd.read_parquet(seg_parq, columns=["security"])
-    have_seg = set(seg_hdr["security"].astype(str).str.strip().unique())
-    missing_seg = sorted(set(securities) - have_seg)
-    assert not missing_seg, f"[segments check] Missing in segments parquet: {', '.join(missing_seg)}"
-
-    # ----- data -----
-    px_all, _, _, _ = import_data(CONFIG["data_excel"])
-    '''
+    # detect bootstrap context (set by bootstrap_universe_oos)
+    _boot = CONFIG.get("__bootstrap_run", {})
+    IN_BOOT = bool(_boot.get("active", False))
+    BOOT_I  = int(_boot.get("i", -1))
+    BOOT_B  = int(_boot.get("B", -1))
 
     G = _make_solver_cfg_from_CONFIG(CONFIG)
     if artifacts is None:
@@ -1854,8 +1866,18 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     df_seg = artifacts["df_seg"]
     px_all = artifacts["px_all"]
     
+    # --- normalize securities ---
+    if securities is None:
+        have_px  = set(map(str, px_all.columns))
+        have_res = set(df_res["security"].astype(str).str.strip().unique())
+        have_seg = set(df_seg["security"].astype(str).str.strip().unique())
+        securities = sorted(have_px & have_res & have_seg)
+    else:
+        securities = [str(x).strip() for x in securities]
+    
     # filter requested to those present
     px_cols = [t for t in securities if t in map(str, px_all.columns)]
+    
     dropped = sorted(set(securities) - set(px_cols))
     if dropped:
         print("[WARN] Dropping securities not found in PX panel:", ", ".join(dropped))
@@ -1899,7 +1921,8 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     
     # SPX benchmark series (for table + relative stats)
     if "SPX" in px_all.columns:
-        spx_daily = pd.to_numeric(px_all["SPX"], errors="coerce").loc[s:e].pct_change().fillna(0.0)
+        spx_daily = pd.to_numeric(px_all["SPX"], errors="coerce").pct_change().fillna(0.0)
+        spx_daily = spx_daily.reindex(full_index).fillna(0.0)
     else:
         spx_daily = pd.Series(index=full_index, dtype=float, name="SPX_daily")
 
@@ -1960,13 +1983,6 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         W_on_dates=W_rebal_dro,
         full_index=full_index, R_df=R_oos,
         delay=k_delay, tc=tc, name="DRO_daily",)
-
-    # ===== Regime-DRO (piecewise on UNION) =====
-    # labels via winning configs
-    df_seg = pd.read_parquet(seg_parq)
-    df_seg["security"] = df_seg["security"].astype(str).str.strip()
-    if df_seg["date"].dtype != "datetime64[ns]":
-        df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
 
     Z_labels     = {}
     Z_labels_fit = {}  # labels on the FIT calendar (includes pre-start history)
@@ -2337,28 +2353,41 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     # SPX left blank by rule
 
     # --- Bootstraps (strategies only) ---
-    
     if run_bootstrap:
         BS = dict(CONFIG.get("BOOTSTRAP", {}))
         B_boot   = int(BS.get("B", 100))
         p_keep   = float(BS.get("p", 0.80))
         alpha_ci = float(BS.get("alpha", 0.05))
         seed_bs  = BS.get("seed", None)
-        
+
         bb = bootstrap_universe_oos(
             securities=names_all, CONFIG=CONFIG,
-            B=B_boot, p=p_keep, alpha=alpha_ci, seed=seed_bs,)
-    
-        def _apply_bb(rows: dict, bb_one: dict):
-            for k, trip in bb_one.items():
+            B=B_boot, p=p_keep, alpha=alpha_ci, seed=seed_bs,
+        )
+
+        # apply percentile CIs
+        def _apply_ci(rows: dict, ci_dict: dict):
+            for k, trip in ci_dict.items():
                 if k in rows:
                     rows[f"{k}_ci_low"]  = trip["ci_low"]
                     rows[f"{k}_ci_high"] = trip["ci_high"]
             return rows
-    
-        rows_mvo = _apply_bb(rows_mvo, bb["MVO"])
-        rows_dro = _apply_bb(rows_dro, bb["DRO"])
-        rows_reg = _apply_bb(rows_reg, bb["RegDRO"])
+
+        rows_mvo = _apply_ci(rows_mvo, bb["ci"]["MVO"])
+        rows_dro = _apply_ci(rows_dro, bb["ci"]["DRO"])
+        rows_reg = _apply_ci(rows_reg, bb["ci"]["RegDRO"])
+
+        # optional: expose mean/std across bootstrap runs
+        def _apply_ms(rows: dict, ms_dict: dict):
+            for k, ms in ms_dict.items():
+                if k in rows:
+                    rows[f"{k}_mean_boot"] = ms["mean"]
+                    rows[f"{k}_std_boot"]  = ms["std"]
+            return rows
+
+        rows_mvo = _apply_ms(rows_mvo, bb["mean_std"]["MVO"])
+        rows_dro = _apply_ms(rows_dro, bb["mean_std"]["DRO"])
+        rows_reg = _apply_ms(rows_reg, bb["mean_std"]["RegDRO"])
     
     # SPX: no CIs by rule
 
@@ -2369,8 +2398,23 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     df_spx = pd.DataFrame([rows_spx])
 
     results_dict = {"MVO": df_mvo, "DRO": df_dro, "RegDRO": df_reg, "SPX": df_spx}
-    print_oos_table(results_dict, model_order=["MVO", "DRO", "RegDRO", "SPX"])
+
+    # print once: outside bootstrap, or only on last bootstrap iteration
+    show_table = True
+    _boot = CONFIG.get("__bootstrap_run", {})
+    IN_BOOT = bool(_boot.get("active", False))
+
+    if IN_BOOT:
+        verbose = False
+        
+    if IN_BOOT:
+        BOOT_I = int(_boot.get("i", -1))
+        BOOT_B = int(_boot.get("B", -1))
+        show_table = (BOOT_I == BOOT_B - 1)
     
+    if show_table:
+        print_oos_table(results_dict, model_order=["MVO", "DRO", "RegDRO", "SPX"])
+
     # outputs
     out = {
         "MVO":     {"fit": fit_mvo,     "summary": rows_mvo},
