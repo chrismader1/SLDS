@@ -179,9 +179,9 @@ def _mbb_indices(T: int, m: int, L: int, rng=None) -> np.ndarray:
         filled += k
     return idx
 
-def bootstrap_np_block_delta(R, n_proj=128, B=256, avg_block=10, alpha=0.05, seed=None):
+def bootstrap_np_block_delta(R, n_proj=128, B=256, block_len=10, alpha=0.05, seed=None):
     """
-    Moving-block bootstrap of the empirical daily panel.
+    10-day moving-block bootstrap of the empirical daily panel.
     Per replicate: draw TWO independent block-resamples of length n,
     compute sliced-W2 between them -> daily distance. Return (1-alpha) quantile.
     """
@@ -191,16 +191,16 @@ def bootstrap_np_block_delta(R, n_proj=128, B=256, avg_block=10, alpha=0.05, see
     rng = np.random.default_rng(seed)
     dists = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        i1 = _mbb_indices(T, n, int(avg_block), rng=rng)
-        i2 = _mbb_indices(T, n, int(avg_block), rng=rng)
+        i1 = _mbb_indices(T, n, block_len, rng=rng)
+        i2 = _mbb_indices(T, n, block_len, rng=rng)
         X1 = R_xp[xp.asarray(i1, dtype=xp.int64)]
         X2 = R_xp[xp.asarray(i2, dtype=xp.int64)]
         dists[b] = sliced_w2_empirical(X1, X2, n_proj=n_proj, rng=None)
     return float(xp.quantile(dists, 1.0 - alpha))
 
-def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, avg_block=10, eps=1e-9, seed=None):
+def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, block_len=10, eps=1e-9, seed=None):
     """
-    Moving-block bootstrap, but distance is Gelbrich W2 between the
+    10-day moving-block bootstrap, but distance is Gelbrich W2 between the
     Gaussian fitted to the original sample (mu0,S0) and the Gaussian fitted to
     each block-resampled sample (mu_b,S_b). Returns daily (not annualized) delta.
     """
@@ -217,7 +217,7 @@ def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, avg_block=10, eps=1e-9,
     rng = np.random.default_rng(seed)
     deltas = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        idx = _mbb_indices(n, n, int(avg_block), rng=rng)
+        idx = _mbb_indices(n, n, block_len, rng=rng)
         Xb  = X[xp.asarray(idx, dtype=xp.int64)]
         mub = xp.mean(Xb, axis=0)
         Xbc = Xb - mub
@@ -229,17 +229,6 @@ def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, avg_block=10, eps=1e-9,
 # Optimization
 # ---------------------------------------------------------------
 
-def to_numpy(a, dtype=float):
-    """Return a NumPy array on host, even if `a` is a CuPy array."""
-    import numpy as _np
-    asnp = getattr(xp, "asnumpy", None)
-    if callable(asnp):
-        try:
-            return asnp(a).astype(dtype, copy=False)
-        except Exception:
-            pass
-    return _np.asarray(a, dtype=dtype)
-    
 def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
     
     """
@@ -300,8 +289,8 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         B      = int((params or {}).get("B", 256))
         n_proj = int((params or {}).get("n_proj", 128))
         seed   = (params or {}).get("seed", None)
-        L      = int((params or {}).get("avg_block", 10))
-        delta_daily = bootstrap_np_block_delta(R, n_proj=n_proj, B=B, avg_block=L, alpha=alpha, seed=seed)
+        L      = int((params or {}).get("block_len", 10))  # fixed 10 by default
+        delta_daily = bootstrap_np_block_delta(R, n_proj=n_proj, B=B, block_len=L, alpha=alpha, seed=seed)
         return AF * float(delta_daily)
     
     if method == "bootstrap_gaussian":
@@ -310,8 +299,8 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         B     = int((params or {}).get("B", 512))
         eps   = float((params or {}).get("epsilon_sigma", 1e-9))
         seed  = (params or {}).get("seed", None)
-        L     = int((params or {}).get("avg_block", 10))
-        delta_daily = bootstrap_gaussian_block_delta(R, alpha=alpha, B=B, avg_block=L, eps=eps, seed=seed)
+        L     = int((params or {}).get("block_len", 10))  # fixed 10 by default
+        delta_daily = bootstrap_gaussian_block_delta(R, alpha=alpha, B=B, block_len=L, eps=eps, seed=seed)
         return AF * float(delta_daily)
     
     raise ValueError(f"Unknown delta_method='{method}'")
@@ -332,12 +321,7 @@ def psd_factor_LtL(Sigma, eps):
         vals = xp.clip(vals, eps, None)
         Sigma_psd = vecs @ xp.diag(vals) @ vecs.T
         C = xp.linalg.cholesky(Sigma_psd)
-    # Explicit device→host copy when using CuPy; no-op for NumPy
-    asnumpy = getattr(xp, "asnumpy", None)
-    if callable(asnumpy):
-        return asnumpy(C.T).astype(_np.float64, copy=False)
-    else:
-        return _np.asarray(C.T, dtype=_np.float64)
+    return _np.asarray(C.T)   # ensure NumPy for CVXPY
 
 def _sigma_unconditional(
     R_df: pd.DataFrame,
@@ -475,8 +459,8 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         raise RuntimeError(f"ECOS/MOSEK failed: status={prob.status}")
 
-    # Always return NumPy on host to avoid CuPy→NumPy implicit conversion errors downstream
-    return _np.asarray(w.value, dtype=float).reshape(-1)
+    return xp.asarray(_np.asarray(w.value).reshape(-1))
+
 
 # ---------------------------------------------------------------
 # Fitting - Actual Data
@@ -892,39 +876,24 @@ def stats_from_series(port_daily, config):
     rf_annual = config["risk_free_rate"]
     AF = int(config.get("annualization_factor", 252))
     rf_daily = (1 + rf_annual) ** (1 / AF) - 1
-    x = xp.asarray(port_daily, dtype=float).reshape(-1)
-    mask = xp.isfinite(x)
-    x = x[mask]
-    if x.size == 0:
-        return float("nan"), float("nan"), float("nan")
-    sigma_daily = xp.std(x, ddof=1)
+    sigma_daily = xp.std(port_daily, ddof=1)
     sigma_annual = sigma_daily * xp.sqrt(AF)
-    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(x))) - 1
-    sharpe_annual = (xp.mean(x) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
+    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(port_daily))) - 1
+    sharpe_annual = (xp.mean(port_daily) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
     return float(mu_annual_geom), float(sigma_annual), float(sharpe_annual)
 
 def _max_drawdown_from_series(port_daily):
     """
-    Max drawdown (most negative) from daily simple returns.
-    Uses device ops for prod; does cummax on host when GPU=True (CuPy lacks accumulate).
+    Max drawdown of a daily-return series.
+    Returns the minimum (most negative) drawdown, e.g. -0.27 for -27%.
     """
-    import numpy as _np
-    x = xp.asarray(port_daily, float).reshape(-1)
+    x = xp.asarray(port_daily, float)
     if x.size == 0:
         return float("nan")
-
-    # equity curve on current backend
     equity = xp.cumprod(1.0 + x)
-
-    if GPU and hasattr(xp, "asnumpy"):  # CuPy path: cummax on host
-        eq_h   = xp.asnumpy(equity)
-        peak_h = _np.maximum.accumulate(eq_h)
-        dd_h   = eq_h / peak_h - 1.0
-        return float(_np.min(dd_h))
-    else:                               # NumPy path: pure xp (xp==np)
-        peak = xp.maximum.accumulate(equity)
-        dd   = equity / peak - 1.0
-        return float(xp.min(dd))
+    peak = xp.maximum.accumulate(equity)
+    dd = equity / peak - 1.0
+    return float(xp.min(dd))
 
 def portfolio_stats(weights, returns, config):
     """Static weights over full horizon."""
@@ -1129,112 +1098,94 @@ def hypothesis_tests(results_dict, tests, alpha=0.05):
                 print(f"   Conclusion: REJECT H0 at {int((1 - alpha) * 100)}% confidence → {A} Sharpe is SUPERIOR to {B}.")
             else:
                 print("   Conclusion: FAIL TO REJECT H0 — No significant Sharpe improvement detected.")
-  
+
 # ---------------------------------------------------------------
-# Block bootstrap for OOS CIs
+# Subsampling bootstrap
 # ---------------------------------------------------------------
 
-def _stationary_bootstrap_indices(T: int, B: int, avg_block: int, rng=None):
-    """Build all bootstrap index vectors ONCE (CPU)."""
-    rng = np.random.default_rng(None) if rng is None else rng
-    p = 1.0 / max(int(avg_block), 1)
-    idx_mat = np.empty((int(B), T), dtype=np.int64)
-    for b in range(int(B)):
-        idx = idx_mat[b]
-        idx[0] = rng.integers(0, T)
-        for t in range(1, T):
-            if rng.random() < p:
-                idx[t] = rng.integers(0, T)
-            else:
-                idx[t] = (idx[t-1] + 1) % T
-    return idx_mat  # shape (B, T) on CPU
-
-def _metrics_from_indices_xp(x_dev, b_dev_or_none, G: dict, AF: int, idx_dev):
-    """Compute all metrics on DEVICE using `xp` (no pandas)."""
-    x = xp.take(x_dev, idx_dev)
-    has_bench = (b_dev_or_none is not None)
-    if has_bench:
-        b = xp.take(b_dev_or_none, idx_dev)
-        mask = xp.isfinite(x) & xp.isfinite(b)
-    else:
-        b = None
-        mask = xp.isfinite(x)
-
-    # stats_from_series and _max_drawdown_from_series already use xp
-    mu_ann, sigma_ann, sharpe_ann = stats_from_series(x, {
-        "n_days": int(x.size),
-        "risk_free_rate": G["risk_free_rate"],
-        "annualization_factor": AF
-    })
-    vol_breach = max(sigma_ann - G["risk_budget"], 0.0)
-    max_dd = _max_drawdown_from_series(x)
-
-    alpha = te = ir = float("nan")
-    hr = float("nan")
-    if has_bench:
-        if int(mask.sum()) > 0:
-            ex = x[mask] - b[mask]
-            alpha = AF * float(ex.mean())
-            te    = (AF ** 0.5) * float(ex.std(ddof=1))
-            ir    = (alpha / te) if np.isfinite(te) and te != 0 else float("nan")
-            hr    = float(xp.mean((x[mask] - b[mask]) >= 0.0))
-
-    return {
-        "mu_ann": mu_ann,
-        "sigma_ann": sigma_ann,
-        "sharpe_ann": sharpe_ann,
-        "vol_breach": vol_breach,
-        "max_dd": max_dd,
-        "alpha_ann": alpha,
-        "te_ann": te,
-        "ir_ann": ir,
-        "hit_rate": hr,
-    }
-
-def block_bootstrap_oos(port_daily, bench_daily_or_none, G, AF,
-                        B=1000, avg_block=10, alpha=0.05, seed=None):
-    """
-    GPU-aware block bootstrap:
-      • uses `xp` everywhere;
-      • keeps data on device;
-      • builds all indices once on CPU, then copies per replicate to device and xp.take’s.
-    """
-    # host arrays (minimal coercion; no pandas in the loop)
-    x_h = np.asarray(port_daily, dtype=float).reshape(-1)
-    b_h = None if bench_daily_or_none is None else np.asarray(bench_daily_or_none, dtype=float).reshape(-1)
-    T = int(x_h.size)
-
-    # move to device
-    x_d = xp.asarray(x_h, dtype=float)
-    b_d = None if b_h is None else xp.asarray(b_h, dtype=float)
-
-    # indices once on CPU
-    idx_mat_h = _stationary_bootstrap_indices(T, B, avg_block, rng=np.random.default_rng(seed))
-
-    keys = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
-            "alpha_ann","te_ann","ir_ann","hit_rate"]
-    coll = {k: [] for k in keys}
-
-    # loop: copy one index vector to device, compute metrics entirely on device
-    for b in range(int(B)):
-        idx_d = xp.asarray(idx_mat_h[b], dtype=xp.int64)
-        m = _metrics_from_indices_xp(x_d, b_d, G, AF, idx_d)
-        for k in keys:
-            coll[k].append(m[k])
-
-    # summarize (host)
-    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
+def _aggregate_ci(samples: dict[str, list[float]], alpha: float) -> dict[str, dict]:
     out = {}
-    for k, vals in coll.items():
-        arr = np.asarray(vals, dtype=float)
-        if not np.isfinite(arr).any():
-            out[k] = {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
+    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
+    for k, vals in samples.items():
+        arr = np.asarray(vals, float)
+        good = arr[np.isfinite(arr)]
+        if good.size == 0:
+            out[k] = {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan}
         else:
             out[k] = {
-                "mean": float(np.nanmean(arr)),
-                "ci_low": float(np.nanquantile(arr, lo_q)),
-                "ci_high": float(np.nanquantile(arr, hi_q)),
+                "mean": float(np.mean(good)),
+                "ci_low": float(np.quantile(good, lo_q)),
+                "ci_high": float(np.quantile(good, hi_q)),
             }
+    return out
+
+def _aggregate_ci_xp(samples: dict[str, list[float]], alpha: float) -> dict[str, dict]:
+    out = {}
+    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
+    for k, vals in samples.items():
+        arr = xp.asarray(vals, dtype=float)
+        mask = xp.isfinite(arr)
+        if int(mask.sum()) == 0:
+            out[k] = {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+        else:
+            good = arr[mask]
+            out[k] = {
+                "mean": float(xp.mean(good)),
+                "ci_low": float(xp.quantile(good, lo_q)),
+                "ci_high": float(xp.quantile(good, hi_q)),
+            }
+    return out
+
+def bootstrap_universe_oos(
+    *,
+    securities: list[str],
+    CONFIG: dict,
+    B: int = 100,
+    p: float = 0.8,
+    alpha: float = 0.05,
+    seed: int | None = None,
+) -> dict[str, dict[str, dict]]:
+    """
+    GPU-accelerated subset sampling + CI aggregation.
+    Pipeline run remains CPU-bound; I/O removed via artifacts cache.
+    """
+    # cache once
+    artifacts = _load_artifacts_cached(CONFIG)
+
+    names = [str(x) for x in securities]
+    n = int(len(names))
+    m = int(max(1, xp.floor(float(p) * n)))
+
+    # Pre-generate B subsets on device: argsort of random matrix gives random permutations
+    rs = None
+    if GPU:
+        xp.random.seed(seed if seed is not None else 0)
+        R = xp.random.random((int(B), n))
+        perm = xp.argsort(R, axis=1)
+        subs = perm[:, :m]                              # (B,m) int64 on device
+    else:
+        rng = np.random.default_rng(seed)
+        subs = np.vstack([rng.permutation(n)[:m] for _ in range(int(B))])
+
+    METRICS = [
+        "mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
+        "alpha_ann","te_ann","ir_ann","hit_rate","gross_exp",
+        "delta_mean","delta_min","delta_max",
+    ]
+    buckets = {s: {k: [] for k in METRICS} for s in ("MVO","DRO","RegDRO")}
+
+    # Run pipeline per subset (still serial and CPU). No nested bootstrap inside.
+    for b in range(int(B)):
+        idx_b = subs[b].get() if GPU else subs[b]       # host indices
+        subset = [names[int(i)] for i in idx_b]
+        res = dro_pipeline(subset, CONFIG, verbose=False, run_bootstrap=False, artifacts=artifacts)
+        for strat in ("MVO","DRO","RegDRO"):
+            row = res[strat]["summary"]
+            for k in METRICS:
+                buckets[strat][k].append(float(row.get(k, np.nan)))
+
+    # CI on GPU
+    out = {s: _aggregate_ci_xp(buckets[s], alpha) for s in buckets}
     return out
 
 # ---------------------------------------------------------------
@@ -1345,7 +1296,6 @@ def import_data(filename):
         df = df.apply(pd.to_numeric, errors='coerce').ffill()
         return df
 
-
     # Core panels
     df_eq_px  = _sheet("SPX_PX")
     df_idx_px = _sheet("IDX_PX")
@@ -1367,6 +1317,23 @@ def import_data(filename):
     pe_all  = (px_all / eps_pos).where(lambda df: df > 0)
 
     return px_all, eps_all, pe_all, ser_vix
+
+# ---- cache artifacts once ----
+def _load_artifacts_cached(CONFIG):
+    res_csv  = CONFIG["results_csv"]
+    seg_parq = CONFIG["segments_parquet"]
+    if not os.path.exists(res_csv):  raise FileNotFoundError(res_csv)
+    if not os.path.exists(seg_parq): raise FileNotFoundError(seg_parq)
+
+    df_res = pd.read_csv(res_csv, usecols=range(10), engine="python")
+    df_res["security"] = df_res["security"].astype(str).str.strip()
+    df_seg = pd.read_parquet(seg_parq)
+    df_seg["security"] = df_seg["security"].astype(str).str.strip()
+    if df_seg["date"].dtype != "datetime64[ns]":
+        df_seg["date"] = pd.to_datetime(df_seg["date"], errors="coerce")
+
+    px_all, eps_all, pe_all, ser_vix = import_data(CONFIG["data_excel"])
+    return dict(df_res=df_res, df_seg=df_seg, px_all=px_all, eps_all=eps_all, pe_all=pe_all, ser_vix=ser_vix)
 
 def _num_series(s):
     return pd.to_numeric(s, errors="coerce").astype("float64")
@@ -1641,16 +1608,16 @@ def _gross_exp_on_window(fit, T_req, win=None):
     """Average gross exposure over a reporting window of length T_req (optionally [a,b) slice)."""
     import numpy as _np
     if fit["type"] == "static":
-        return float(_np.sum(_np.abs(to_numpy(fit["w"], float))))
+        return float(_np.sum(_np.abs(fit["w"])))
     segs = [int(x) for x in fit["segs"]]
     a0, b0 = (0, 10**12) if win is None else (int(win[0]), int(win[1]))
     num = 0.0
     for (a, b), w in zip(zip(segs[:-1], segs[1:]), fit["w_list"]):
         L = max(0, min(b, b0) - max(a, a0))
         if L > 0:
-            num += L * float(_np.sum(_np.abs(to_numpy(w, float))))
+            num += L * float(_np.sum(_np.abs(w)))
     return num / max(T_req, 1)
-
+    
 def make_index_rebal(
     intersection_index: pd.DatetimeIndex,
     start_dt: str | None,
@@ -1834,299 +1801,12 @@ def _period_ends(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
     """Return last available date per period on `idx` (e.g., month-end on trading calendar)."""
     return pd.DatetimeIndex(pd.Series(idx).groupby(idx.to_period(freq)).max())
 
-def _nested_bootstrap_piecewise_mvo_dro(
-    R_full: pd.DataFrame,
-    *,
-    marks: list[int],           # rebal marks on FIT calendar (incl 0 and T_fit)
-    a_oos: int,                 # start pos on FIT calendar for OOS slice
-    b_oos: int,                 # end-exclusive pos on FIT calendar for OOS slice
-    AF: int,
-    min_lb: int,
-    max_lb: int,
-    lam_shr: float,
-    G: dict,
-    params_dro: dict | None,    # None => MVO, else DRO params
-    delay: int,
-    tc: float,
-    B: int,
-    avg_block: int,
-    alpha: float,
-    seed=None,
-):
-    """
-    Stationary block nested bootstrap for piecewise MVO/DRO:
-      • resample FIT-length paths;
-      • re-optimize at each rebal mark using bootstrapped window;
-      • evaluate on OOS slice [a_oos:b_oos).
-    Bench-relative metrics set to NaN (no bootstrapped SPX path here).
-    """
-    import numpy as _np
-    _rng = _np.random.default_rng(seed)
-
-    X_fit = R_full.to_numpy(float, copy=False)          # (T_fit, N)
-    cols  = list(R_full.columns)
-    T_fit, N = X_fit.shape
-    T_oos = int(b_oos - a_oos)
-    if T_oos <= 0:
-        raise ValueError("OOS slice must be non-empty.")
-
-    idx_mat = _stationary_bootstrap_indices(T_fit, max(int(B), 1), int(avg_block), rng=_rng)
-
-    keys = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
-            "alpha_ann","te_ann","ir_ann","hit_rate"]
-    coll = {k: [] for k in keys}
-
-    for b in range(int(B)):
-        idx = idx_mat[b]
-        Rb  = X_fit[idx, :]                      # FIT-length
-        Rb_oos = Rb[a_oos:b_oos, :]              # OOS slice, length T_oos
-
-        # Re-optimize on bootstrapped path at each rebal decision
-        w_list = []
-        pos_list = []
-        for a in marks[:-1]:
-            if a < a_oos or a >= b_oos:
-                continue  # decisions outside OOS slice don't affect OOS PnL
-            ws = _window_start(a, min_lb, max_lb)
-            X_win = Rb[ws:a, :]
-            if X_win.shape[0] < max(2, min_lb):
-                # carry forward previous if exists, else zeros
-                w_list.append(w_list[-1] if w_list else np.zeros(N, float))
-                pos_list.append(a)
-                continue
-
-            # compute μ, Σ on window (simple returns → annualize)
-            X_win_df = pd.DataFrame(X_win, columns=cols)
-            mask_all = np.ones(X_win_df.shape[0], dtype=bool)
-            mu_ann = compute_mean_from_window(X_win_df, mask_all, min_obs=min_lb, ann=AF)
-            Sig_ann = compute_cov_from_window(X_win_df, ann=AF, shrink_lambda=lam_shr, min_obs=min_lb)
-
-            # delta and solve
-            if params_dro is None:
-                delta = 0.0
-            else:
-                params_k = dict(params_dro)
-                params_k["n_ref"] = X_win_df.shape[0]
-                delta = compute_delta(params_k.get("kappa", 1.0),
-                                      mu_ann, Sig_ann,
-                                      R=X_win_df.to_numpy(float),
-                                      params=params_k)
-            w_k = solve_optimizer(mu_ann, Sig_ann, float(delta), G, verbose=False)
-            w_list.append(w_k); pos_list.append(a)
-
-        # Build OOS PnL on synthetic index 0..T_oos-1
-        if w_list:
-            # map FIT positions within [a_oos, b_oos) to 0..T_oos-1
-            rows = []
-            for p, w in zip(pos_list, w_list):
-                rows.append(pd.Series(np.asarray(w, float), index=cols, name=int(p - a_oos)))
-            W_on_dates = pd.DataFrame(rows).sort_index()
-        else:
-            # no rebal inside OOS slice → all cash
-            W_on_dates = pd.DataFrame([pd.Series(np.zeros(N), index=cols, name=0)])
-
-        idx_boot = pd.RangeIndex(T_oos)
-        R_df_boot = pd.DataFrame(Rb_oos, index=idx_boot, columns=cols)
-        port_series, _, _ = pnl_with_delay_and_cost(
-            W_on_dates=W_on_dates, full_index=idx_boot, R_df=R_df_boot,
-            delay=int(delay), tc=float(tc), name="piecewise_daily*"
-        )
-
-        # Metrics
-        x = port_series.to_numpy(float)
-        mu, sig, sh = stats_from_series(x, {"n_days": x.size, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
-        coll["mu_ann"].append(mu)
-        coll["sigma_ann"].append(sig)
-        coll["sharpe_ann"].append(sh)
-        coll["vol_breach"].append(max(sig - G["risk_budget"], 0.0))
-        coll["max_dd"].append(_max_drawdown_from_series(x))
-        # Bench-relative not computed in nested piecewise for MVO/DRO
-        for k in ("alpha_ann","te_ann","ir_ann","hit_rate"):
-            coll[k].append(_np.nan)
-
-    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
-    out = {}
-    for k, vals in coll.items():
-        arr = np.asarray(vals, float)
-        if arr.size == 0 or not np.isfinite(arr).any():
-            out[k] = {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
-        else:
-            out[k] = {
-                "mean": float(np.nanmean(arr)),
-                "ci_low": float(np.nanquantile(arr, lo_q)),
-                "ci_high": float(np.nanquantile(arr, hi_q)),
-            }
-    return out
-
-def nested_bootstrap_regdro(
-    R_full: pd.DataFrame,
-    signals_fit: pd.DataFrame,
-    names_all: list[str],
-    *,
-    AF: int,
-    lookback: int,
-    min_obs: int,
-    params_reg: dict,
-    G: dict,
-    delay: int,
-    tc: float,
-    B: int,
-    avg_block: int,
-    alpha: float,
-    seed=None,
-):
-    """
-    Nested stationary block bootstrap for RegDRO:
-    resample FIT-length paths, rebuild regime breaks, re-optimize per break,
-    then evaluate OOS metrics on the last T_oos days of each bootstrapped path.
-    Returns dict of {metric: {mean, ci_low, ci_high}} like block_bootstrap_oos.
-    """
-    import numpy as _np
-    _rng = _np.random.default_rng(seed)
-
-    # host arrays (FIT window)
-    R_fit = R_full[names_all].to_numpy(float, copy=False)              # (T_fit, N)
-    S_fit = signals_fit[names_all].to_numpy(int, copy=False)           # (T_fit, N)
-    T_fit, N = R_fit.shape
-    T_oos = int(S_fit.shape[0] - (T_fit - S_fit.shape[0])) if S_fit.shape[0] <= T_fit else S_fit.shape[0]
-    # Use the last |OOS| days for evaluation in each replicate
-    T_oos = len(signals_fit.index.intersection(R_full.index))
-
-    # if no explicit OOS length provided via intersection, default to last 252 trading days
-    if T_oos <= 0 or T_oos > T_fit:
-        T_oos = min(252, T_fit)
-
-    # Pre-build bootstrap indices on FIT length
-    idx_mat = _stationary_bootstrap_indices(T_fit, max(int(B), 1), int(avg_block), rng=_rng)
-
-    keys = ["mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
-            "alpha_ann","te_ann","ir_ann","hit_rate"]
-    coll = {k: [] for k in keys}
-
-    # fast helpers that mirror existing pipeline pieces
-    def _make_rows_from_port(series_vals):
-        x = _np.asarray(series_vals, float)
-        mu, sig, sh = stats_from_series(x, {"n_days": x.size, "risk_free_rate": G["risk_free_rate"], "annualization_factor": AF})
-        return {
-            "mu_ann": mu,
-            "sigma_ann": sig,
-            "sharpe_ann": sh,
-            "vol_breach": max(sig - G["risk_budget"], 0.0),
-            "max_dd": _max_drawdown_from_series(x),
-        }
-
-    def _bench_rel(port, bench):
-        ex = port - bench
-        ex = ex[_np.isfinite(ex)]
-        if ex.size == 0:
-            return _np.nan, _np.nan, _np.nan, _np.nan
-        alpha = AF * float(ex.mean())
-        te    = (AF ** 0.5) * float(ex.std(ddof=1))
-        ir    = alpha / te if _np.isfinite(te) and te != 0 else _np.nan
-        hr    = float((ex >= 0.0).mean())
-        return alpha, te, ir, hr
-
-    # Bootstrap loop
-    for b in range(max(int(B), 1)):
-        idx = idx_mat[b]                                        # length T_fit
-        Rb = R_fit[idx, :]                                      # (T_fit, N)
-        Sb = S_fit[idx, :]                                      # (T_fit, N)
-
-        # OOS slice = last T_oos rows
-        Rb_oos = Rb[-T_oos:, :]                                 # (T_oos, N)
-        Sb_oos = Sb[-T_oos:, :].astype(int)
-
-        # Regime union breaks on bootstrapped path
-        chg_any = (np.diff(Sb_oos, axis=0) != 0).any(axis=1)
-        taus = [0] + (np.where(chg_any)[0].astype(int) + 1).tolist() + [T_oos]
-
-        # Walk forward and re-optimize
-        w_list = []
-        for a, c in zip(taus[:-1], taus[1:]):
-            t_dec = max(a, 0)                                   # decision at segment start
-            active = [j for j in range(N) if Sb_oos[t_dec, j] == 1 and np.isfinite(Rb_oos[t_dec, j])]
-            if len(active) == 0:
-                w_list.append(np.zeros(N, dtype=float)); continue
-
-            a_win = max(0, t_dec - int(lookback)); b_win = t_dec
-            X_win = Rb_oos[a_win:b_win, :][:, active]           # window matrix
-            if X_win.shape[0] < min_obs:
-                w_list.append(np.zeros(N, dtype=float)); continue
-
-            # per-asset masks from signals in the window
-            masks = []
-            for j in active:
-                mj = (Sb_oos[a_win:b_win, j] == 1)
-                masks.append(mj)
-
-            # compute μ, Σ on window
-            cols = [names_all[j] for j in active]
-            X_win_df = pd.DataFrame(X_win, columns=cols)
-            mu_vals = []
-            ok_keep = []
-            ok_masks = []
-            for jj, col in enumerate(cols):
-                m = masks[jj]
-                try:
-                    mu_j = compute_mean_from_window(X_win_df[[col]], m, min_obs=min_obs, ann=AF)[0]
-                    mu_vals.append(float(mu_j)); ok_keep.append(col); ok_masks.append(m)
-                except Exception:
-                    pass
-            if not ok_keep:
-                w_list.append(np.zeros(N, dtype=float)); continue
-            mu_vec = np.asarray(mu_vals, float)
-            Sig_ann = compute_cov_from_window(X_win_df[ok_keep], ann=AF, shrink_lambda=float(G.get("sigma_shrinkage_lambda", 0.0)), min_obs=min_obs)
-            # delta and solve
-            X_src = X_win_df[ok_keep].to_numpy(float)
-            params_k = dict(params_reg)
-            params_k["n_ref"] = X_src.shape[0]
-            delta_k = compute_delta(params_k.get("kappa", 1.0), mu_vec, Sig_ann, R=X_src, params=params_k)
-            w_sub = solve_optimizer(mu_vec, Sig_ann, delta_k, G, verbose=False)
-
-            # map back to N
-            w_full = np.zeros(N, dtype=float)
-            for jj, col in enumerate(ok_keep):
-                j_idx = names_all.index(col)
-                w_full[j_idx] = w_sub[jj]
-            w_list.append(w_full)
-
-        # Build daily PnL with delay and costs on synthetic index
-        idx_boot = pd.RangeIndex(T_oos)
-        R_df_boot = pd.DataFrame(Rb_oos, index=idx_boot, columns=names_all)
-        rows = []
-        for pos, w in zip([t for t in taus[:-1]], w_list):
-            rows.append(pd.Series(w, index=names_all, name=pos))
-        W_on_dates = pd.DataFrame(rows).sort_index()
-        port_series, _, _ = pnl_with_delay_and_cost(W_on_dates, idx_boot, R_df_boot, delay=int(delay), tc=float(tc), name="RegDRO_daily*")
-
-        # Metrics
-        rows_b = _make_rows_from_port(port_series.to_numpy(float))
-        # no benchmark series in this nested call; set bench-relative to NaN
-        rows_b["alpha_ann"], rows_b["te_ann"], rows_b["ir_ann"], rows_b["hit_rate"] = (np.nan, np.nan, np.nan, np.nan)
-
-        for k in keys:
-            coll[k].append(rows_b[k])
-
-    # Summarize
-    lo_q, hi_q = alpha/2.0, 1.0 - alpha/2.0
-    out = {}
-    for k, vals in coll.items():
-        arr = _np.asarray(vals, float)
-        if arr.size == 0 or not _np.isfinite(arr).any():
-            out[k] = {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
-        else:
-            out[k] = {
-                "mean": float(_np.nanmean(arr)),
-                "ci_low": float(_np.nanquantile(arr, lo_q)),
-                "ci_high": float(_np.nanquantile(arr, hi_q)),
-            }
-    return out
-
 # -------------------------
 # Pipeline
 # -------------------------
 
-def dro_pipeline(securities, CONFIG, verbose=True):
+def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifacts=None):
+
     """
     Strict version:
       • ONLY make_index_rebal (MVO/DRO) and make_index_union (RegDRO)
@@ -2136,6 +1816,8 @@ def dro_pipeline(securities, CONFIG, verbose=True):
       • δ aggregates included for DRO and RegDRO
       • SPX included in OOS summary table
     """
+
+    '''
     G = _make_solver_cfg_from_CONFIG(CONFIG)
 
     # ----- artifacts -----
@@ -2163,7 +1845,15 @@ def dro_pipeline(securities, CONFIG, verbose=True):
 
     # ----- data -----
     px_all, _, _, _ = import_data(CONFIG["data_excel"])
+    '''
 
+    G = _make_solver_cfg_from_CONFIG(CONFIG)
+    if artifacts is None:
+        artifacts = _load_artifacts_cached(CONFIG)
+    df_res = artifacts["df_res"]
+    df_seg = artifacts["df_seg"]
+    px_all = artifacts["px_all"]
+    
     # filter requested to those present
     px_cols = [t for t in securities if t in map(str, px_all.columns)]
     dropped = sorted(set(securities) - set(px_cols))
@@ -2242,7 +1932,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     mvo_rows = []
     for dt, w in zip(rebal_dates_fit, fit_mvo["w_list"]):
         if dt >= oos_start:
-            mvo_rows.append(pd.Series(to_numpy(w, float), index=R_use.columns, name=dt))
+            mvo_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
     W_rebal_mvo = pd.DataFrame(mvo_rows).sort_index()
         
     mvo_daily, W_daily_mvo, W_eff_mvo = pnl_with_delay_and_cost(
@@ -2263,7 +1953,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     dro_rows = []
     for dt, w in zip(rebal_dates_fit, fit_dro_pw["w_list"]):
         if dt >= oos_start:
-            dro_rows.append(pd.Series(to_numpy(w, float), index=R_use.columns, name=dt))
+            dro_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
     W_rebal_dro = pd.DataFrame(dro_rows).sort_index()
         
     dro_daily, W_daily_dro, W_eff_dro = pnl_with_delay_and_cost(
@@ -2548,8 +2238,7 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     
     reg_rows = []
     for dt, w in zip(full_index[taus[:-1]], fit_reg["w_list"]):
-        reg_rows.append(pd.Series(to_numpy(w, float), index=names_all, name=dt))
-        
+        reg_rows.append(pd.Series(np.asarray(w, float), index=names_all, name=dt))
     W_on_dates_reg = pd.DataFrame(reg_rows).sort_index()
     
     regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(
@@ -2648,104 +2337,30 @@ def dro_pipeline(securities, CONFIG, verbose=True):
     # SPX left blank by rule
 
     # --- Bootstraps (strategies only) ---
-    B_boot   = int(CONFIG.get("BOOTSTRAP", {}).get("B", 1000))
-    L_block  = int(CONFIG.get("BOOTSTRAP", {}).get("avg_block", 10))
-    alpha_ci = float(CONFIG.get("BOOTSTRAP", {}).get("alpha", 0.05))
-    seed_bs  = CONFIG.get("BOOTSTRAP", {}).get("seed", None)
-    run_bs   = bool(CONFIG.get("BOOTSTRAP", {}).get("run_bootstrap", False))
     
-    if run_bs:
-        # positions of the strict OOS slice on the FIT index
-        a_oos = full_index_fit.get_loc(full_index[0])
-        b_oos = full_index_fit.get_loc(full_index[-1]) + 1
+    if run_bootstrap:
+        BS = dict(CONFIG.get("BOOTSTRAP", {}))
+        B_boot   = int(BS.get("B", 100))
+        p_keep   = float(BS.get("p", 0.80))
+        alpha_ci = float(BS.get("alpha", 0.05))
+        seed_bs  = BS.get("seed", None)
+        
+        bb = bootstrap_universe_oos(
+            securities=names_all, CONFIG=CONFIG,
+            B=B_boot, p=p_keep, alpha=alpha_ci, seed=seed_bs,)
     
-        # MVO nested bootstrap (re-opt at rebal marks on bootstrapped paths)
-        bb_mvo = _nested_bootstrap_piecewise_mvo_dro(
-            R_full=df_returns_full[px_cols],
-            marks=marks,
-            a_oos=a_oos,
-            b_oos=b_oos,
-            AF=AF,
-            min_lb=min_lb,
-            max_lb=max_lb,
-            lam_shr=lam,
-            G=G,
-            params_dro=None,   # MVO
-            delay=k_delay,
-            tc=tc,
-            B=int(B_boot),
-            avg_block=int(L_block),
-            alpha=float(alpha_ci),
-            seed=seed_bs,
-        )
+        def _apply_bb(rows: dict, bb_one: dict):
+            for k, trip in bb_one.items():
+                if k in rows:
+                    rows[f"{k}_ci_low"]  = trip["ci_low"]
+                    rows[f"{k}_ci_high"] = trip["ci_high"]
+            return rows
     
-        # DRO nested bootstrap
-        params_dro_for_bs = dict(params_dro)  # same params as used above
-        bb_dro = _nested_bootstrap_piecewise_mvo_dro(
-            R_full=df_returns_full[px_cols],
-            marks=marks,
-            a_oos=a_oos,
-            b_oos=b_oos,
-            AF=AF,
-            min_lb=min_lb,
-            max_lb=max_lb,
-            lam_shr=lam,
-            G=G,
-            params_dro=params_dro_for_bs,  # DRO
-            delay=k_delay,
-            tc=tc,
-            B=int(B_boot),
-            avg_block=int(L_block),
-            alpha=float(alpha_ci),
-            seed=seed_bs,
-        )
+        rows_mvo = _apply_bb(rows_mvo, bb["MVO"])
+        rows_dro = _apply_bb(rows_dro, bb["DRO"])
+        rows_reg = _apply_bb(rows_reg, bb["RegDRO"])
     
-        # RegDRO nested bootstrap (already nested)
-        bb_reg = nested_bootstrap_regdro(
-            R_full=df_returns_full,               # FIT-length returns matrix
-            signals_fit=signals_fit,              # dense signals on FIT calendar
-            names_all=names_all,
-            AF=AF,
-            lookback=lookback,
-            min_obs=min_obs,
-            params_reg=params_reg,
-            G=G,
-            delay=k_delay,
-            tc=tc,
-            B=int(B_boot),
-            avg_block=int(L_block),
-            alpha=float(alpha_ci),
-            seed=seed_bs,
-        )
-    else:
-        # no bootstrap: attach NaN CIs and keep point estimates only
-        def _no_ci(rows):
-            return {
-                "mu_ann": {"mean": rows["mu_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                "sigma_ann": {"mean": rows["sigma_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                "sharpe_ann": {"mean": rows["sharpe_ann"], "ci_low": np.nan, "ci_high": np.nan},
-                "vol_breach": {"mean": rows["vol_breach"], "ci_low": np.nan, "ci_high": np.nan},
-                "max_dd": {"mean": rows["max_dd"], "ci_low": np.nan, "ci_high": np.nan},
-                "alpha_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                "te_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                "ir_ann": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-                "hit_rate": {"mean": np.nan, "ci_low": np.nan, "ci_high": np.nan},
-            }
-        bb_mvo = _no_ci(rows_mvo)
-        bb_dro = _no_ci(rows_dro)
-        bb_reg = _no_ci(rows_reg)
-    # NOTE: no SPX bootstrap — we never attach *_ci_* to SPX
-
-    def _apply_bb(rows: dict, bb: dict):
-        for k, trip in bb.items():
-            if k in rows:
-                rows[f"{k}_ci_low"]  = trip["ci_low"]
-                rows[f"{k}_ci_high"] = trip["ci_high"]
-        return rows
-
-    rows_mvo = _apply_bb(rows_mvo, bb_mvo)
-    rows_dro = _apply_bb(rows_dro, bb_dro)
-    rows_reg = _apply_bb(rows_reg, bb_reg)
+    # SPX: no CIs by rule
 
     # Assemble DataFrames for the table
     df_mvo = pd.DataFrame([rows_mvo])
