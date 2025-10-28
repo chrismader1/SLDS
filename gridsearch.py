@@ -660,6 +660,10 @@ def pipeline_actual(securities, CONFIG):
     
     # making sure CONFIG carries everything IOManager expects
     CONFIG.setdefault("segments_header_cols", ("security","config","date","t","z"))
+    # include all identifiers so the parquet is self-describing
+    CONFIG.setdefault("segments_header_cols",
+                      ("security","config","date","t","z","dt","n_regimes","dim_latent"
+                       ,"single_subspace","train_window","overlap_window"),)
     CONFIG.setdefault("tmp_results_fmt",  "{tmp_dir}/results_tmp_{security}.csv")
     CONFIG.setdefault("tmp_segments_fmt", "{tmp_dir}/segments_tmp_{security}.csv")
     io_mgr = IOManager(CONFIG)
@@ -715,23 +719,55 @@ def pipeline_actual(securities, CONFIG):
         io_mgr.append_temp_results(security, out)
     
     def _append_segments_tmp(security, config_label, details, io_mgr):
+        """
+        Append per-day regime labels to the temp segments CSV **with full identifiers** so
+        the final parquet can be reconstructed without external context.
+        Adds: dt, n_regimes, dim_latent, single_subspace, train_window, overlap_window.
+        """
         if not details:
-            # print(f"[GS][segments] {security} | {config_label} — no details; skip")
             return
+    
         frames = []
         for d in details:
-            idx = pd.DatetimeIndex(d["px_index"])
-            frames.append(pd.DataFrame({
-                "security": security,
-                "config":   config_label,
-                "date":     idx,
-                "t":        np.arange(len(idx), dtype=int),
-                "z":        np.asarray(d["zhat_cusum"], dtype=int),
-            }))
-        out = pd.concat(frames, ignore_index=True)
-        # print(f"[GS][segments] {security} | {config_label} -> rows={len(out)}")
-        io_mgr.append_temp_segments(security, out)
+            # params chosen for this stitched run
+            r, b = d.get("params", (None, None))
+            n_regimes       = None if r is None else int(r.get("n_regimes"))
+            dim_latent_raw  = None if r is None else r.get("dim_latent")
+            # serialize dim_latent robustly (scalar or vector)
+            if isinstance(dim_latent_raw, (list, tuple, np.ndarray)):
+                dim_latent = json.dumps([int(x) for x in dim_latent_raw])
+            elif dim_latent_raw is None:
+                dim_latent = None
+            else:
+                dim_latent = int(dim_latent_raw)
     
+            single_subspace = None if r is None else bool(r.get("single_subspace", True))
+            train_window    = None if b is None else int(b.get("train_window"))
+            overlap_window  = None if b is None else int(b.get("overlap_window"))
+    
+            # dt in consistent string form (matches results CSV convention)
+            dt_val = CONFIG["dt"]
+            dt_str = f"1/{int(round(1.0/dt_val))}" if dt_val > 0 else str(dt_val)
+    
+            idx = pd.DatetimeIndex(d["px_index"])
+            out_df = pd.DataFrame({
+                "security":       security,
+                "config":         config_label,
+                "date":           idx,
+                "t":              np.arange(len(idx), dtype=int),
+                "z":              np.asarray(d["zhat_cusum"], dtype=int),
+                "dt":             dt_str,
+                "n_regimes":      n_regimes,
+                "dim_latent":     dim_latent,
+                "single_subspace":single_subspace,
+                "train_window":   train_window,
+                "overlap_window": overlap_window,
+            })
+            frames.append(out_df)
+    
+        out = pd.concat(frames, ignore_index=True)
+        io_mgr.append_temp_segments(security, out)
+
     # canonical series helper (per security)
     for security in securities:
 
