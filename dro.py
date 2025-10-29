@@ -1601,45 +1601,6 @@ def _make_solver_cfg_from_CONFIG(CONFIG):
         "max_pos_size":   max_pos_size,
     }
 
-def _select_regime_set_S_star_from_train(px_train: pd.Series, zhat_train: np.ndarray, dt: float) -> set:
-    """
-    Pick S* (subset of regimes) by maximizing in-sample CAGR_rel using the
-    0/1 mapping w_k ∈ {0,1}. Returns set of regimes with w_k=1.
-    """
-    regimes = np.unique(zhat_train)
-    # daily returns (fillna 0 so cumprod works cleanly)
-    bench_ret = px_train.pct_change().fillna(0.0)
-    bench_idx = (1.0 + bench_ret).cumprod()
-    n_years = len(bench_ret) * dt
-    cagr_bench = bench_idx.iloc[-1] ** (1.0 / max(n_years, 1e-12)) - 1.0
-
-    best_cagr_rel, best_S = -np.inf, set()
-    # try all non-trivial 0/1 assignments (at least one 0 and one 1)
-    import itertools
-    for w in itertools.product([0, 1], repeat=len(regimes)):
-        if 0 not in w or 1 not in w:
-            continue
-        S = {rk for rk, val in zip(regimes, w) if val == 1}
-        weights = np.array([1 if z in S else 0 for z in zhat_train], dtype=float)
-        strat_ret = bench_ret.values * weights
-        strat_idx = np.cumprod(1.0 + strat_ret)
-        cagr_strat = strat_idx[-1] ** (1.0 / max(n_years, 1e-12)) - 1.0
-        cagr_rel = (1.0 + cagr_strat) / (1.0 + cagr_bench) - 1.0
-        if cagr_rel > best_cagr_rel:
-            best_cagr_rel, best_S = cagr_rel, S
-    return best_S
-
-def _signals_from_zhat(zhat, S_star):
-    z = np.asarray(zhat)
-    sig = np.zeros(z.shape, dtype=int)
-    for i, val in enumerate(z):
-        try:
-            k = int(val)
-        except (ValueError, TypeError):
-            k = None
-        sig[i] = 1 if (k is not None and k in S_star) else 0
-    return sig
-
 def _gross_exp_on_window(fit, T_req, win=None):
     """Average gross exposure over a reporting window of length T_req (optionally [a,b) slice)."""
     import numpy as _np
@@ -1731,44 +1692,6 @@ def _expand_daily_weights(weights_on_dates: pd.DataFrame, full_index: pd.Datetim
         zero_row = pd.DataFrame([np.zeros(w.shape[1])], index=[full_index[0]], columns=w.columns)
         w = pd.concat([zero_row, w], axis=0)
     return w.reindex(full_index).ffill().fillna(0.0)
-
-def _expand_daily_signals(signals_on_dates: pd.DataFrame, full_index: pd.DatetimeIndex) -> pd.DataFrame:
-    """
-    Forward-fill 0/1 signals (rows are sparse change dates) to every day in full_index.
-    Returns an int DataFrame (0/1).
-    """
-    s = signals_on_dates.sort_index()
-    if len(s.index) == 0:
-        return pd.DataFrame(0, index=full_index, columns=signals_on_dates.columns, dtype=int)
-    if s.index[0] > full_index[0]:
-        zero_row = pd.DataFrame([np.zeros(s.shape[1])], index=[full_index[0]], columns=s.columns)
-        s = pd.concat([zero_row, s], axis=0)
-    out = s.reindex(full_index).ffill().fillna(0.0)
-    return out.astype(int)
-
-def compute_rslds_hit_rate(
-    signals_dense: pd.DataFrame,
-    full_index: pd.DatetimeIndex,
-    returns_df: pd.DataFrame,
-    securities: list[str],
-) -> float:
-    """
-    rSLDS hit rate from a *dense* daily 0/1 signals table.
-    Returns a single number: hr_mean = P(return >= 0 | signal == 1) across all secs/days.
-    """
-    S = signals_dense.copy()
-    for m in securities:
-        if m not in S.columns:
-            S[m] = 0
-    S = (S[securities].reindex(full_index).fillna(0) > 0).astype(int)
-    R = returns_df.loc[full_index, securities].astype(float)
-    X = R.to_numpy(dtype=float, copy=False)
-    Z = S.to_numpy(dtype=int, copy=False)
-    finite = np.isfinite(X)
-    trials = (Z == 1) & finite
-    hits = trials & (X >= 0.0)
-    n = int(trials.sum())
-    return float(hits.sum() / n) if n > 0 else float("nan")
     
 def pnl_with_delay_and_cost(
     W_on_dates: pd.DataFrame,
@@ -2016,73 +1939,6 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     names_all = list(avail)
     pos = {n:i for i,n in enumerate(names_all)}
 
-    # ===== Signals table (FIT range) & Hit Rate =====
-    # Build DAILY 0/1 signals once on the FIT calendar [start − lookback : end],
-    dt = 1.0 / 252.0
-    cal_full = pd.DatetimeIndex(px_all.index)
-    first_oos_dt = full_index[0]
-    
-    # (a) Winning-config labels per asset on full calendar (to learn S* from pre-OOS data)
-    z_raw_by_sec = {}
-    for sec in names_all:
-        cfg_best = _select_best_config(df_res, sec, CONFIG.get("prefer_configs"))
-        z_raw_by_sec[sec] = _labels_from_segments_df(df_seg, sec, cfg_best)
-    
-    # (b) Learn S* per asset using only pre-OOS train
-    S_star_by_sec = {}
-    for tic in names_all:
-        px_ser_full = _num_series(px_all[tic].reindex(cal_full))
-        z_ser_full  = z_raw_by_sec[tic].reindex(cal_full).astype("float64")
-        train_mask = (cal_full < first_oos_dt)
-        train_mask &= z_ser_full.notna().to_numpy()
-        train_mask &= px_ser_full.notna().to_numpy()
-        if train_mask.sum() >= 2:
-            px_train   = px_ser_full.loc[cal_full[train_mask]]
-            zhat_train = z_ser_full.loc[cal_full[train_mask]].astype(int).to_numpy()
-            S_star_by_sec[tic] = _select_regime_set_S_star_from_train(
-                px_train=px_train, zhat_train=zhat_train, dt=dt
-            )
-        else:
-            S_star_by_sec[tic] = set()
-    
-    # (c) DAILY signals on FIT index [start − max_lookback_days : end] using Z_labels_fit[*]
-    signals_fit = pd.DataFrame(
-        {
-            tic: pd.Series(
-                _signals_from_zhat(
-                    (lambda z: (
-                        lambda zf: (zf[0].__setitem__(zf[1], z[zf[1]].astype(np.int64, copy=False)) or zf[0])
-                    )( (np.full(z.shape, -1, dtype=np.int64), np.isfinite(z)) )
-                    )(np.asarray(Z_labels_fit[tic], dtype=float)),
-                    S_star_by_sec[tic],
-                ),
-                index=full_index_fit,
-                name=tic,
-            ).astype(int)
-            for tic in names_all
-        },
-        index=full_index_fit,
-    ).astype(int)
-    
-    # (d) Save once to CSV (no config entry)
-    signals_csv_path = "signals_table.csv"
-    signals_fit.to_csv(signals_csv_path, index_label="date")
-    
-    # (e) OOS subset & sparse on-dates (for display/diagnostics)
-    signals_fit_oos = signals_fit.loc[full_index, names_all]
-    signals_on_dates = signals_fit_oos.iloc[[0]].copy()
-    chg = signals_fit_oos.diff().fillna(0).ne(0)
-    if chg.values.any():
-        chg_dates = signals_fit_oos.index[chg.any(axis=1)]
-        signals_on_dates = pd.concat([signals_on_dates, signals_fit_oos.loc[chg_dates]], axis=0).sort_index()
-    
-    # (f) Hit rate using the precomputed *dense* signals table and the updated function (hr only)
-    hr_mean = compute_rslds_hit_rate(
-        signals_dense=signals_fit_oos,
-        full_index=full_index,
-        returns_df=df_returns,
-        securities=names_all,)
-
     if bool(verbose):
         _section("RegDRO")
     
@@ -2094,140 +1950,96 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         t_mid = min(max(a, 0), len(full_index) - 1)
         D     = full_index[t_mid]                    # decision date on OOS calendar
         D_pos = full_index_fit.get_loc(D)            # corresponding position on FIT calendar
-        
-        # Active at decision date (use FIT index by position to avoid any .loc pitfalls)
-        sig_today = signals_fit.iloc[D_pos].reindex(names_all).fillna(0).astype(int)
-        ret_today = df_returns_full.iloc[D_pos].reindex(names_all).to_numpy(float)
-        A_k = [n for n in names_all if (sig_today[n] == 1) and np.isfinite(ret_today[names_all.index(n)])]
 
-        if not A_k:
-            if bool(verbose):
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: no active assets)")
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G)))
-            delta_list.append(np.nan)
-            continue
-    
-        # regime-conditioned window on FIT history: [D-lookback, D-1]
-        D = full_index[t_mid]
+        # Current decision date on OOS calendar and its position on the FIT calendar
+        t_mid = min(max(a, 0), len(full_index) - 1)
+        D     = full_index[t_mid]
         D_pos = full_index_fit.get_loc(D)
-        a_win = max(0, D_pos - lookback)   # lookback = CONFIG["REBAL"]["max_lookback_days"]
-        b_win = D_pos                      # end exclusive -> up to D-1
+
+        # Lookback window on FIT calendar: [D_pos - lookback, D_pos)
+        a_win = max(0, D_pos - lookback)
+        b_win = D_pos
         win_idx = full_index_fit.take(np.arange(a_win, b_win, dtype=int))
 
-        # --- Window matrix on FIT window (simple returns) for the **active** set ---
-        X_win_df = df_returns_full.loc[win_idx, A_k]
+        # Build keep list: asset must have a finite current label, and ≥ min_obs
+        # observations in the lookback with the SAME label as today AND finite returns.
+        keep, masks = [], []
+        for n in names_all:
+            z_ser = np.asarray(Z_labels_fit[n], dtype=float)
+            z_now = z_ser[D_pos]
+            if not np.isfinite(z_now):
+                continue
+            m = (z_ser[a_win:b_win] == z_now)  # same-regime mask in window
+            if not np.any(m):
+                continue
+            x = df_returns_full.loc[win_idx, n].to_numpy(float)
+            m = m & np.isfinite(x)
+            if int(m.sum()) >= min_obs:
+                keep.append(n)
+                masks.append(m)
 
-        # --- Per-asset in-regime masks from the **dense signals** table ---
-        keep, masks, counts = [], [], []
-        for n in A_k:
-            m = (signals_fit.loc[win_idx, n].to_numpy(dtype=int) == 1)  # (T_win,) bool
-            xj = X_win_df[n].to_numpy(float)
-            cnt = int(np.isfinite(xj[m]).sum())
-            if cnt >= min_obs:
-                keep.append(n); masks.append(m); counts.append(cnt)
-
-        # If nothing passes min_obs, skip before any caps/solve
-        if len(keep) == 0:
+        if not keep:
             if bool(verbose):
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: insufficient in-regime obs)")
-            if w_list:
-                w_list.append(np.asarray(w_list[-1], float))
-            else:
-                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+                dt_str = getattr(D, 'date', lambda: D)()
+                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: no qualifying assets)")
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
             delta_list.append(np.nan)
             continue
 
-        # --- CAP FEASIBILITY (use number of optimization vars = len(keep)) ---
+        # CAP FEASIBILITY (optional; unchanged logic)
         c_max = float(CONFIG["PORTFOLIO"]["max_cash"])
         u     = float(CONFIG["PORTFOLIO"]["max_pos_size"])
-
         cap_applies = bool(G.get("no_shorting", False)) and np.isfinite(u) and (u > 0.0)
         N_req  = int(np.ceil((1.0 - c_max) / max(u, 1e-12))) if cap_applies else 0
-
         if cap_applies and (len(keep) < N_req):
             if bool(verbose):
-                print(f"[MIN SAMPLE CHECK] date={pd.to_datetime(D).date()}  N_keep={len(keep)}  N_req={N_req}  -> SKIP")
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: <min sample)")
+                dt_str = getattr(D, 'date', lambda: D)()
+                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: <min sample for caps)")
             _cap_skips += 1
-            if w_list:
-                w_list.append(np.asarray(w_list[-1], float))
-            else:
-                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
             delta_list.append(np.nan)
             continue
-            
-        # --- Mean (per asset) and covariance (unconditional on kept assets) ---
-        mu_vals = []
-        for j, n in enumerate(keep):
-            mu_j = compute_mean_from_window(X_win_df[[n]], masks[j], min_obs=min_obs, ann=AF)[0]
-            mu_vals.append(float(mu_j))
-        mu = np.asarray(mu_vals, dtype=float)
-        
+
+        # Window matrix and conditional μ (per-asset, masked), unconditional Σ on kept assets
+        X_win_df = df_returns_full.loc[win_idx, keep]
+        AF = int(CONFIG.get("annualization_factor", 252))
+        mu = np.asarray([
+            compute_mean_from_window(X_win_df[[n]], masks[j], min_obs=min_obs, ann=AF)[0]
+            for j, n in enumerate(keep)
+        ], dtype=float)
+
         lam = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
         Sig = compute_cov_from_window(X_win_df[keep], ann=AF, shrink_lambda=lam, min_obs=min_obs)
-        
-        # --- Validate inputs and solve DRO (no try/except; pre-check and print/skip) ---
+
+        # Solve DRO using the same window samples (for bootstrap-based δ methods)
         X_win = X_win_df[keep].to_numpy(float)
-        
-        # 1) Finite checks on μ and Σ
+
         Sig_np = np.atleast_2d(np.asarray(Sig, dtype=float))
         if (not np.isfinite(mu).all()) or (not np.isfinite(Sig_np).all()):
-            if bool(verbose):
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: non-finite mu/Sigma)")
-            if w_list:
-                w_list.append(np.asarray(w_list[-1], float))
-            else:
-                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan)
-            continue
-        
-        # 2) PSD check on Σ (symmetrize, then eigenvals)
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            delta_list.append(np.nan);  continue
         Sig_sym = 0.5 * (Sig_np + Sig_np.T)
-        eigvals = np.linalg.eigvalsh(Sig_sym)
-        if (eigvals.size == 0) or (not np.isfinite(eigvals).all()) or (eigvals.min() < -1e-10):
-            if bool(verbose):
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                evmin = float(np.nanmin(eigvals)) if eigvals.size else float("nan")
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: Sigma not PSD; min eig={evmin:.3e})")
-            if w_list:
-                w_list.append(np.asarray(w_list[-1], float))
-            else:
-                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan)
-            continue
-        
-        # 3) Safe to solve
-        w_sub, delta_k = solve_dro(mu, Sig, params_reg, G, R=X_win, verbose=bool(verbose))
+        ev = np.linalg.eigvalsh(Sig_sym)
+        if (ev.size == 0) or (not np.isfinite(ev).all()) or (ev.min() < -1e-10):
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            delta_list.append(np.nan);  continue
 
+        w_sub, delta_k = solve_dro(mu, Sig, params_reg, G, R=X_win, verbose=bool(verbose))
         if not np.isfinite(delta_k):
-            if bool(verbose):
-                dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: non-finite delta)")
-            if w_list:
-                w_list.append(np.asarray(w_list[-1], float))
-            else:
-                w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan)
-            continue
-            
+            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            delta_list.append(np.nan);  continue
+
         if bool(verbose):
-            dt_str = getattr(full_index[t_mid], 'date', lambda: full_index[t_mid])()
+            dt_str = getattr(D, 'date', lambda: D)()
             print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta={float(delta_k):.4f}")
-            excluded = [n for n in A_k if n not in keep]
-            print(f"   Excluded(<min_obs={min_obs}): {', '.join(excluded) if excluded else '(none)'}")
-    
             _print_mu_by_name(keep, mu)
 
-        # map sub-weights back to full universe
         w_full = np.zeros(len(names_all))
         for j, n in enumerate(keep):
             w_full[pos[n]] = w_sub[j]
         w_list.append(w_full)
         delta_list.append(float(delta_k))
+        
 
     # --- CAP CHECK summary (percent skipped due to caps) ---
     _cap_total = int(_cap_total)
@@ -2432,11 +2244,6 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         },
         "securities": names_all,
         "G": G,
-        "signals": {
-        "signals_on_dates": signals_on_dates,
-        "signals_oos": signals_fit_oos,
-        "rSLDS_hit_rate": float(hr_mean),
-        },
         "holdings": {"MVO": H_mvo, "DRO": H_dro, "RegDRO": H_reg},
     }
 
