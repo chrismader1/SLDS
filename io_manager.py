@@ -80,6 +80,8 @@ class IOManager:
     @staticmethod
     def _coerce_segments_schema(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
+    
+        # core
         if "date" in out.columns:
             out["date"] = pd.to_datetime(out["date"], errors="coerce")
         if "t" in out.columns:
@@ -90,6 +92,20 @@ class IOManager:
             out["security"] = out["security"].astype("string")
         if "config" in out.columns:
             out["config"] = out["config"].astype("string")
+        if "dt" in out.columns:
+            # stored as string like "1/252"
+            out["dt"] = out["dt"].astype("string")
+        if "n_regimes" in out.columns:
+            out["n_regimes"] = pd.to_numeric(out["n_regimes"], errors="coerce").astype("Int16")
+        if "dim_latent" in out.columns:
+            # may be int or JSON list; persist as string
+            out["dim_latent"] = out["dim_latent"].astype("string")
+        if "single_subspace" in out.columns:
+            out["single_subspace"] = out["single_subspace"].astype("boolean")
+        if "train_window" in out.columns:
+            out["train_window"] = pd.to_numeric(out["train_window"], errors="coerce").astype("Int32")
+        if "overlap_window" in out.columns:
+            out["overlap_window"] = pd.to_numeric(out["overlap_window"], errors="coerce").astype("Int32")
         return out
     
     def _peek_file(self, path, n=3, label="(peek)"):
@@ -111,6 +127,13 @@ class IOManager:
             pd.DataFrame(columns=self.results_header_cols).to_csv(
                 self.results_csv, index=False, **self._WRITE_KW_RESULTS)
 
+    def _assert_segments_schema(self, df: pd.DataFrame):
+        required = list(self.segments_header_cols)
+        missing = [c for c in required if c not in df.columns]
+        assert not missing, (
+            f"segments parquet missing required columns: {missing}. "
+            f"Expected: {required}"
+        )
     # ---------- temp appends (fast) ----------
     def append_temp_results(self, security, df):
         if df is None or df.empty:
@@ -174,27 +197,26 @@ class IOManager:
         if not (os.path.exists(tmp_csv) and os.path.getsize(tmp_csv) > 0):
             logger.debug(f"[IO][parquet] nothing to append from {tmp_csv}")
             return
-
+    
         logger.debug(f"[IO][parquet] start merge tmp -> parquet\n  tmp={tmp_csv}\n  pq={parquet_path}")
         self._peek_file(tmp_csv, n=2, label="seg-tmp-read")
-
+    
         import pyarrow as pa, pyarrow.parquet as pq
         lock = FileLock(parquet_path + ".lock")
         with lock:
             new_df = pd.read_csv(tmp_csv, **self._READ_KW_SEG)
             new_df = self._coerce_segments_schema(new_df)
-            logger.debug(f"[IO][parquet] read tmp rows={new_df.shape[0]} cols={new_df.shape[1]}")
-            if new_df.shape[0] == 0:
-                logger.debug("[IO][parquet] tmp has 0 rows; skip")
-                return
-
+            self._assert_segments_schema(new_df)  # assert on new chunk
+    
             if os.path.exists(parquet_path) and os.path.getsize(parquet_path) > 0:
                 old = pd.read_parquet(parquet_path, engine="pyarrow")
                 old = self._coerce_segments_schema(old)
                 df = new_df if old.shape[0] == 0 else pd.concat([old, new_df], ignore_index=True)
             else:
                 df = new_df
-
+    
+            self._assert_segments_schema(df)  # assert on final frame
+    
             d = os.path.dirname(parquet_path) or "."
             with tempfile.NamedTemporaryFile("wb", delete=False, dir=d, suffix=".parquet") as tf:
                 tmp_out = tf.name
@@ -241,7 +263,7 @@ class IOManager:
         if "security" not in df.columns:
             raise ValueError("Parquet missing 'security' column.")
         df = self._coerce_segments_schema(df)
+        df = self._coerce_segments_schema(df)
+        self._assert_segments_schema(df)
         return df[df["security"] == security].copy().sort_values(["config","date","t"])
-
-
-
+        

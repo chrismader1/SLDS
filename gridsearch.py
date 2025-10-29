@@ -1,3 +1,4 @@
+
 # --------------------------------------------------------------------------------------
 # Import modules
 # --------------------------------------------------------------------------------------
@@ -657,15 +658,14 @@ def pipeline_actual(securities, CONFIG):
         "cagr_rel_cusum","cagr_strat_cusum","cagr_bench_cusum",
         "cagr_rel_ex_ante","cagr_strat_ex_ante","cagr_bench_ex_ante",]
     CONFIG["results_header_cols"] = results_header_cols
-    
-    # making sure CONFIG carries everything IOManager expects
-    CONFIG.setdefault("segments_header_cols", ("security","config","date","t","z"))
-    # include all identifiers so the parquet is self-describing
-    CONFIG.setdefault("segments_header_cols",
-                      ("security","config","date","t","z","dt","n_regimes","dim_latent"
-                       ,"single_subspace","train_window","overlap_window"),)
+    # segments parquet schema (authoritative, ordered)
+    CONFIG["segments_header_cols"] = [
+        "security", "config", "date", "t", "z",
+        "dt", "n_regimes", "dim_latent",
+        "single_subspace", "train_window", "overlap_window",]
     CONFIG.setdefault("tmp_results_fmt",  "{tmp_dir}/results_tmp_{security}.csv")
     CONFIG.setdefault("tmp_segments_fmt", "{tmp_dir}/segments_tmp_{security}.csv")
+    
     io_mgr = IOManager(CONFIG)
 
     # store results
