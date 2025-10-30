@@ -86,6 +86,42 @@ def save_out(out: dict, path: str):
         with open(path, "wb") as f:
             pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+# -------------------------
+# Array adapters (GPU/CPU boundaries)
+# -------------------------
+
+def _is_cupy_array(a):
+    try:
+        import cupy as _cp
+        return isinstance(a, _cp.ndarray) or hasattr(a, "__cuda_array_interface__")
+    except Exception:
+        return hasattr(a, "__cuda_array_interface__")
+
+def asnumpy_strict(a, dtype=None, order=None):
+    """
+    Return a *NumPy* ndarray (never CuPy) from possibly-CuPy input.
+    Optionally cast dtype and memory order.
+    """
+    import numpy as _np
+    if _is_cupy_array(a):
+        import cupy as _cp
+        out = _cp.asnumpy(a)
+    else:
+        out = _np.asarray(a)
+    if dtype is not None:
+        out = out.astype(dtype, copy=False)
+    if order in ("C", "F"):
+        out = _np.array(out, dtype=out.dtype, order=order, copy=False)
+    return out
+
+def asxp(a, dtype=None):
+    """
+    Convert to xp array (CuPy if GPU, else NumPy). If already xp, return as-is.
+    """
+    if _is_cupy_array(a):
+        return a.astype(dtype, copy=False) if dtype is not None else a
+    return xp.asarray(a, dtype=dtype)
+
 # ---------------------------------------------------------------
 # Wasserstein helpers
 # ---------------------------------------------------------------
@@ -318,30 +354,28 @@ def _to_xp(A):
 
 def psd_factor_LtL(Sigma, eps):
     """
-    Return L such that Sigma ≈ L.T @ L (constraint ||L w|| ≤ rho).
-    Always returns a NumPy float64, contiguous array for CVXPY.
-    This version is *pure NumPy* end-to-end to avoid any implicit CuPy→NumPy conversion.
+    Return L (NumPy float64, contiguous) such that Sigma ≈ L.T @ L.
+    Absolutely no implicit CuPy→NumPy conversions.
     """
     import numpy as _np
 
-    # ---- FORCE NUMPY INPUT ----
-    mod = getattr(Sigma, "__module__", "")
-    if hasattr(Sigma, "get"):              # CuPy ndarray
-        S = Sigma.get()
-    elif mod.startswith("cupy"):            # some CuPy-ish object without .get
-        try:
-            # xp is CuPy when GPU=True; asnumpy avoids implicit __array__
-            S = xp.asnumpy(Sigma)
-        except Exception:
-            # Last resort (shouldn’t normally hit)
+    # --- FORCE HOST ARRAY (defensive against any GPU-backed object) ---
+    try:
+        import cupy as _cp
+        if isinstance(Sigma, _cp.ndarray) or hasattr(Sigma, "__cuda_array_interface__"):
+            S = _cp.asnumpy(Sigma)                           # explicit device→host
+        elif hasattr(Sigma, "get") and callable(Sigma.get):  # generic CuPy-like
+            S = Sigma.get()
+        else:
             S = _np.asarray(Sigma)
-    else:
+    except Exception:
+        # If CuPy isn't available (or any import fails), just coerce to NumPy
         S = _np.asarray(Sigma)
 
-    S = _np.asarray(S, dtype=_np.float64, order="C")
+    # Now ensure dtype/layout without re-entering CuPy
+    S = _np.array(S, dtype=_np.float64, order="C", copy=False)
 
-    # ---- NUMPY-ONLY FACTORIZATION ----
-    # Symmetrize & robustify
+    # --- Symmetrize & regularize; strictly NumPy below this line ---
     S_sym = 0.5 * (S + S.T)
     try:
         C = _np.linalg.cholesky(S_sym + float(eps) * _np.eye(S_sym.shape[0], dtype=S_sym.dtype))
@@ -351,7 +385,7 @@ def psd_factor_LtL(Sigma, eps):
         S_psd = (vecs * vals) @ vecs.T
         C = _np.linalg.cholesky(S_psd)
 
-    # Return L so that L^T L ≈ Σ : L = C^T (NumPy, contiguous, float64)
+    # L so that L^T L ≈ Σ
     return _np.ascontiguousarray(C.T, dtype=_np.float64)
 
 def _sigma_unconditional(
@@ -424,22 +458,41 @@ def _sigma_unconditional(
     return Sigma_ann, True, counts
 
 def solve_optimizer(mu, Sigma, delta, config, verbose=False):
+    
     import numpy as _np
-    n = len(mu)
+    
+    n   = int(len(mu))
     rho = float(config["risk_budget"])
     eps = float(config["epsilon_sigma"])
 
-    Sigma = xp.asarray(Sigma, dtype=xp.float64)
-    if not xp.isfinite(Sigma).all():
-        Sigma = xp.nan_to_num(Sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    # ---- Strict NumPy boundary for CVXPY ----
+    Sigma_np = asnumpy_strict(Sigma, dtype=_np.float64, order="C")
+    _np.nan_to_num(Sigma_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Build L such that ||L w||_2 <= rho  (Sigma ≈ L.T @ L)
-    L = _np.asarray(psd_factor_LtL(Sigma, eps))
 
+    # ---- Strict NumPy boundary for CVXPY ----
+    Sigma_np = asnumpy_strict(Sigma, dtype=_np.float64, order="C")
+    
+    # Absolute guard (even if asnumpy_strict ever regresses)
+    try:
+        import cupy as _cp
+        if isinstance(Sigma_np, _cp.ndarray) or hasattr(Sigma_np, "__cuda_array_interface__"):
+            Sigma_np = _cp.asnumpy(Sigma_np)
+    except Exception:
+        pass
+    
+    Sigma_np = _np.array(Sigma_np, dtype=_np.float64, order="C", copy=False)
+    
+    # Sanity while debugging (safe to leave on)
+    assert not hasattr(Sigma_np, "__cuda_array_interface__"), "Sigma_np is still CUDA-backed!"
+    assert isinstance(Sigma_np, _np.ndarray), f"Sigma_np type={type(Sigma_np)}"
+    
+    L = psd_factor_LtL(Sigma_np, eps)  # guaranteed pure NumPy
+    mu_np = asnumpy_strict(mu, dtype=_np.float64)     # NumPy float64
+
+    # ---- CVXPY variables / objective ----
     w = cp.Variable(n)
     t = cp.Variable(nonneg=True)
-
-    mu_np = _np.asarray(mu, dtype=float)
     objective = cp.Minimize(float(delta) * t - mu_np @ w)
 
     no_shorting = bool(config.get("no_shorting", False))
@@ -620,60 +673,75 @@ def fit_dro_rebalanced(R_df: pd.DataFrame, params, G, ann: int, marks: list[int]
 # ---------------------------------------------------------------
 
 def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sigma_ann, config, rtol=1e-6, atol=1e-9):
-    n_days, n_assets = returns_train.shape
-    # AF = int(config.get("annualization_factor", config["n_days"]))
-    AF = int(config.get("annualization_factor", 252))
-    mu_train_ann_assets    = AF * returns_train.mean(axis=0)
-    sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
+    """
+    Safe matmul version: keep math on a single backend per op.
+    - Portfolio series computed on xp (GPU if available).
+    - Any NumPy-only ops (e.g., psd_factor_LtL) are cast back to xp for norms.
+    """
+    # Coerce inputs
+    Rtr = asxp(returns_train, dtype=float)   # (T,d) xp
+    Rev = asxp(returns_eval,  dtype=float)   # (T,d) xp
+    wxp = asxp(w, dtype=float).reshape(-1)   # (d,) xp
 
-    # exact constraint metric (matches solver): ||L w||_2 with L^T L ≈ Σ_ann  
-    L = psd_factor_LtL(Sigma_ann, config["epsilon_sigma"])  # NumPy for CVXPY
-    L_xp = _to_xp(L)                                        # cast to xp for xp math
-    risk_train_ann = float(xp.linalg.norm(L_xp @ w))
+    n_days, n_assets = Rtr.shape
+    AF = int(config.get("annualization_factor", 252))
+
+    # Asset-level stats on xp
+    mu_train_ann_assets    = AF * xp.mean(Rtr, axis=0)
+    sigma_train_ann_assets = xp.sqrt(AF) * xp.std(Rtr, axis=0, ddof=1)
+
+    # Exact SOC risk with NumPy Cholesky, then xp-norm
+    L_np = psd_factor_LtL(Sigma_ann, config["epsilon_sigma"])  # NumPy
+    L_xp = asxp(L_np, dtype=float)                             # xp
+    risk_train_ann = float(xp.linalg.norm(L_xp @ wxp))
     tol = max(atol, rtol * max(rho, risk_train_ann))
     ok_train = bool(risk_train_ann <= rho + tol)
 
-    # returns (annualized)
-    ret_train_ann = float(mu_train_ann_assets @ w)
-
-    # OOS realized vol like multi-trial breach (from series)
-    port_eval = returns_eval @ w
+    # Train/Eval returns (annualized means) on xp
+    ret_train_ann = float(mu_train_ann_assets @ wxp)
+    port_eval = Rev @ wxp                                   # (T,)
     _, risk_eval_ann, _ = stats_from_series(port_eval, dict(config, annualization_factor=AF))
-    mu_eval_ann_assets = AF * returns_eval.mean(axis=0)
-    ret_eval_ann = float(mu_eval_ann_assets @ w)
+    mu_eval_ann_assets = AF * xp.mean(Rev, axis=0)
+    ret_eval_ann = float(mu_eval_ann_assets @ wxp)
 
-    gross_exposure = float(xp.sum(xp.abs(w)))
-    top_idx = xp.argsort(w)[-3:][::-1]
-    nz = xp.where(w != 0)[0]
-    bot_idx = nz[xp.argsort(w[nz])[:3]] if nz.size else xp.array([], dtype=int)
+    # Some quick exposure summaries (unchanged semantics)
+    gross_exposure = float(xp.sum(xp.abs(wxp)))
+    top_idx = xp.argsort(wxp)[-3:][::-1]
+    nz = xp.where(wxp != 0)[0]
+    bot_idx = nz[xp.argsort(wxp[nz])[:3]] if nz.size else xp.array([], dtype=int)
 
 def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
                        taus_display, seg_deltas, config=None):
     """
-    Pretty-printer for piecewise portfolios.
-    Uses 'annualization_factor' (AF) if provided in config, else falls back to n_days.
+    Safe accumulation of piecewise portfolio series on xp backend.
     """
-    n_days, n_assets = returns_train.shape
-    # AF = int((config or {}).get("annualization_factor", (config or {}).get("n_days", n_days)))
+    # Coerce to xp once
+    Rtr = asxp(returns_train, dtype=float)   # (T,d)
+    Rev = asxp(returns_eval,  dtype=float)   # (T,d)
+    n_days, n_assets = Rtr.shape
     AF = int((config or {}).get("annualization_factor", 252))
 
-    # concatenated series for realized stats (like multi-trial)
-    port_train = xp.zeros(n_days); port_eval = xp.zeros(n_days)
+    # Concatenate per-segment portfolio series on xp
+    port_train = xp.zeros(n_days, dtype=float)
+    port_eval  = xp.zeros(n_days, dtype=float)
     for k, w in enumerate(w_list):
         a, b = segs[k], segs[k+1]
-        port_train[a:b] = returns_train[a:b] @ w
-        port_eval[a:b]  = returns_eval[a:b]  @ w
+        wxp = asxp(w, dtype=float).reshape(-1)
+        port_train[a:b] = (Rtr[a:b] @ wxp)
+        port_eval[a:b]  = (Rev[a:b] @ wxp)
 
-    # Use the same stats helper used everywhere else (respects AF)
-    cfg = {"n_days": n_days,
-           "risk_free_rate": (config or {}).get("risk_free_rate", 0.0),
-           "annualization_factor": AF}
+    # Annualized stats (helper coerces to xp internally)
+    cfg = {
+        "n_days": n_days,
+        "risk_free_rate": float((config or {}).get("risk_free_rate", 0.0)),
+        "annualization_factor": AF,
+    }
     ret_train_ann, risk_train_ann, _ = stats_from_series(port_train, cfg)
     ret_eval_ann,  risk_eval_ann,  _ = stats_from_series(port_eval,  cfg)
 
-    # Asset-level sample stats (arith. daily → annualized with AF)
-    mu_train_ann_assets    = AF * returns_train.mean(axis=0)
-    sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
+    # Asset-level sample stats (arith. daily → annualized)
+    mu_train_ann_assets    = AF * xp.mean(Rtr, axis=0)
+    sigma_train_ann_assets = xp.sqrt(AF) * xp.std(Rtr, axis=0, ddof=1)
 
 def fit_mvo(data, params, G):
     """
@@ -881,59 +949,59 @@ def evaluate_portfolio(fit, data, G):
 def evaluate_regime_independently(fit, data, G):
     """
     Performs an independent evaluation for each segment of a piecewise portfolio.
+    Uses NumPy for segment matmul to avoid CuPy↔pandas boundary issues,
+    then stats_from_series handles xp coercion internally.
     """
-    n_days = data["n_days"]
+    n_days = int(data["n_days"])
     test = data["test"]
-    
-    # This dictionary will hold all the independent, per-segment stats
+
+    # Force test panel to NumPy for safe matmul
+    R_test = np.asarray(test, dtype=float)
+
     stats_oos = {}
-    
-    # Add the delta list to the output for reference
     dlist = list(map(float, fit.get("delta_list", [])))
     for j, dj in enumerate(dlist, start=1):
         stats_oos[f"delta_k{j}"] = dj
 
-    # Calculate and store performance for each segment independently
     for k, (a, b) in enumerate(zip(fit["segs"][:-1], fit["segs"][1:])):
         wk = fit["w_list"][k]
-        seg_length = b - a
-        
-        # Define default values for empty/trivial segments
-        mu_seg, sigma_seg, sharpe_seg, vol_breach_seg = xp.nan, xp.nan, xp.nan, xp.nan
-        gross_exp_seg = xp.sum(xp.abs(wk))
+        seg_length = int(b - a)
+
+        mu_seg = sigma_seg = sharpe_seg = vol_breach_seg = np.nan
+        gross_exp_seg = float(np.sum(np.abs(asnumpy_strict(wk, dtype=float))))
 
         if seg_length > 1:
-            # 1. Isolate the segment's out-of-sample data
-            seg_series_oos = test[a:b] @ wk
-            
-            # 2. Create a config for this segment's independent evaluation
-            #    (relies on the corrected stats_from_series from dro.py)
+            # Segment series in NumPy
+            wk_np = asnumpy_strict(wk, dtype=float).reshape(-1)
+            seg_series_oos = R_test[a:b] @ wk_np
+
             seg_config = dict(G)
             seg_config["n_days"] = n_days
             seg_config["annualization_factor"] = int(data.get("ann_factor", 252))
-            
-            # 3. Calculate statistics for this segment ONLY
+
             mu_seg, sigma_seg, sharpe_seg = stats_from_series(seg_series_oos, seg_config)
             vol_breach_seg = max(sigma_seg - G["risk_budget"], 0.0)
 
-        # 4. Store results with segment-specific keys
         stats_oos[f"mu_ann_k{k+1}"] = mu_seg
         stats_oos[f"sigma_ann_k{k+1}"] = sigma_seg
         stats_oos[f"sharpe_ann_k{k+1}"] = sharpe_seg
         stats_oos[f"vol_breach_k{k+1}"] = vol_breach_seg
         stats_oos[f"gross_exp_k{k+1}"] = gross_exp_seg
-    
+
     return stats_oos
     
 def stats_from_series(port_daily, config):
-    n_days = config["n_days"]
-    rf_annual = config["risk_free_rate"]
     AF = int(config.get("annualization_factor", 252))
-    rf_daily = (1 + rf_annual) ** (1 / AF) - 1
-    sigma_daily = xp.std(port_daily, ddof=1)
+    rf_annual = float(config.get("risk_free_rate", 0.0))
+    # Force to xp on entry to avoid NumPy/CuPy function mismatch
+    x = asxp(port_daily, dtype=float).ravel()
+    if x.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    rf_daily = (1.0 + rf_annual) ** (1.0 / AF) - 1.0
+    sigma_daily = xp.std(x, ddof=1)
     sigma_annual = sigma_daily * xp.sqrt(AF)
-    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(port_daily))) - 1
-    sharpe_annual = (xp.mean(port_daily) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
+    mu_annual_geom = xp.exp(AF * xp.mean(xp.log1p(x))) - 1.0
+    sharpe_annual = (xp.mean(x) - rf_daily) / sigma_daily * xp.sqrt(AF) if sigma_daily > 0 else xp.nan
     return float(mu_annual_geom), float(sigma_annual), float(sharpe_annual)
 
 def _max_drawdown_from_series(port_daily):
@@ -950,9 +1018,13 @@ def _max_drawdown_from_series(port_daily):
     return float(xp.min(dd))
 
 def portfolio_stats(weights, returns, config):
-    """Static weights over full horizon."""
-    weights = xp.asarray(weights).reshape(-1)
-    port_daily = returns @ weights
+    """
+    Static weights over full horizon.
+    Multiplication done in NumPy to avoid CuPy<->pandas issues.
+    """
+    R = np.asarray(returns, dtype=float)                  # (T,d) NumPy
+    w = asnumpy_strict(weights, dtype=float).reshape(-1)  # (d,) NumPy
+    port_daily = R @ w                                    # (T,) NumPy
     mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
     max_dd = _max_drawdown_from_series(port_daily)
@@ -961,35 +1033,34 @@ def portfolio_stats(weights, returns, config):
         "sigma_ann": sigma_annual,
         "sharpe_ann": sharpe_annual,
         "vol_breach": vol_breach,
-        "max_dd": max_dd,}
-
+        "max_dd": max_dd,
+    }
+    
 def portfolio_stats_multipiece(w_list, taus, returns, config):
-    """
-    w_list: list of weights per piece, length = len(taus)-1
-    taus:   [0=τ0, τ1, ..., τK=n_days]
-    """
-
     import numpy as _np
     taus = [int(x) for x in list(taus)]
-    R = _np.asarray(returns, dtype=float)
-    assert taus[0] == 0 and taus[-1] == int(config["n_days"]) and len(w_list) == len(taus) - 1, \
-        "segments/weights mismatch or calendar length mismatch"
-    
-    n_days = config["n_days"]
+    R = _np.asarray(returns, dtype=float)   # NumPy
+    n_days = int(config["n_days"])
     assert taus[0] == 0 and taus[-1] == n_days and len(w_list) == len(taus) - 1
-    port_daily = xp.empty(n_days, dtype=float)
+
+    # Build in NumPy to avoid device mismatch, convert later for stats
+    port_daily_np = _np.empty(n_days, dtype=float)
     for k in range(len(w_list)):
         a, b = taus[k], taus[k + 1]
-        port_daily[a:b] = returns[a:b] @ xp.asarray(w_list[k]).reshape(-1)
-    mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily, config)
+        w_np = asnumpy_strict(w_list[k], dtype=float).reshape(-1)
+        port_daily_np[a:b] = R[a:b] @ w_np
+
+    # stats_from_series will coerce to xp internally
+    mu_annual_geom, sigma_annual, sharpe_annual = stats_from_series(port_daily_np, config)
     vol_breach = max(sigma_annual - config["risk_budget"], 0.0)
-    max_dd = _max_drawdown_from_series(port_daily)
+    max_dd = _max_drawdown_from_series(port_daily_np)
     return {
         "mu_ann": mu_annual_geom,
         "sigma_ann": sigma_annual,
         "sharpe_ann": sharpe_annual,
         "vol_breach": vol_breach,
-        "max_dd": max_dd,}
+        "max_dd": max_dd,
+    }
 
 # ---------------------------------------------------------------
 # Hypothesis Testing
@@ -1932,7 +2003,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     mvo_rows = []
     for dt, w in zip(rebal_dates_fit, fit_mvo["w_list"]):
         if dt >= oos_start:
-            mvo_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+            mvo_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=R_use.columns, name=dt))
     W_rebal_mvo = pd.DataFrame(mvo_rows).sort_index()
         
     mvo_daily, W_daily_mvo, W_eff_mvo = pnl_with_delay_and_cost(
@@ -1953,7 +2024,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     dro_rows = []
     for dt, w in zip(rebal_dates_fit, fit_dro_pw["w_list"]):
         if dt >= oos_start:
-            dro_rows.append(pd.Series(np.asarray(w, float), index=R_use.columns, name=dt))
+            dro_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=R_use.columns, name=dt))
     W_rebal_dro = pd.DataFrame(dro_rows).sort_index()
         
     dro_daily, W_daily_dro, W_eff_dro = pnl_with_delay_and_cost(
@@ -2120,7 +2191,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     
     reg_rows = []
     for dt, w in zip(full_index[taus[:-1]], fit_reg["w_list"]):
-        reg_rows.append(pd.Series(np.asarray(w, float), index=names_all, name=dt))
+        reg_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=names_all, name=dt))
     W_on_dates_reg = pd.DataFrame(reg_rows).sort_index()
     
     regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(
