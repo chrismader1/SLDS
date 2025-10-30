@@ -2031,11 +2031,27 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     Z_labels     = {}
     Z_labels_fit = {}  # labels on the FIT calendar (includes pre-start history)
     
-    # Enforce RSLDS preference list from CONFIG (acts as prefer_configs)
-    prefer = CONFIG.get("RSLDS", None)
-    if not isinstance(prefer, (list, tuple)) or len(prefer) == 0:
-        raise KeyError("CONFIG['RSLDS'] must be a non-empty list of rSLDS configs.")
+    def _required_config_names(lst):
+        names = []
+        for x in lst:
+            names.append(str(x["config"] if isinstance(x, dict) and "config" in x else x).strip())
+        return names
     
+    required = CONFIG.get("RSLDS", None)
+    if not isinstance(required, (list, tuple)) or len(required) == 0:
+        raise KeyError("CONFIG['RSLDS'] must be a non-empty list of required rSLDS configs.")
+    
+    required_configs = _required_config_names(required)
+    
+    avail_cfgs = df_res["config"].astype(str).str.strip()
+    seen = set(avail_cfgs)
+    
+    missing = sorted(set(required_configs) - seen)
+    if missing:
+        raise RuntimeError(
+            "results_csv is missing REQUIRED rSLDS config(s): "
+            f"{missing}. Seen configs in results_csv: {sorted(seen)}")
+
     for sec in px_cols:
         cfg_best = _select_best_config(df_res, sec, prefer)
         if cfg_best is None:
