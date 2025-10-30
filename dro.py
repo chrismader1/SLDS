@@ -1213,7 +1213,7 @@ def bootstrap_universe_oos(
             row = res[strat]["summary"]
             for k in METRICS:
                 buckets[strat][k].append(float(row.get(k, np.nan)))
-
+    
     # cleanup context
     CONFIG.pop("__bootstrap_run", None)
 
