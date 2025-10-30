@@ -305,23 +305,44 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
     
     raise ValueError(f"Unknown delta_method='{method}'")
 
+def _to_xp(A):
+    """
+    Ensure A is an xp (CuPy/NumPy via 'xp') array for downstream xp math.
+    If A is already an xp array, it is returned as-is.
+    """
+    mod = getattr(A, "__module__", "")
+    # If A is a NumPy ndarray (or anything not xp), convert to xp
+    if mod.startswith("numpy"):
+        return xp.asarray(A)
+    return A
+
 def psd_factor_LtL(Sigma, eps):
     """
-    Return L such that Sigma ≈ L.T @ L (so the constraint is ||L w|| ≤ rho).
-    We form L by transposing a lower Cholesky.
+    Return L such that Sigma ≈ L.T @ L (constraint ||L w|| ≤ rho).
+    Always return a NumPy float64, contiguous array for CVXPY.
+    Works on both NumPy and CuPy inputs.
     """
     import numpy as _np
+
+    # Symmetrize
     Sigma_sym = 0.5 * (Sigma + Sigma.T)
+
+    # Robust PSD + Cholesky on xp
     try:
-        # single-shot minimal regularization
-        C = xp.linalg.cholesky(Sigma_sym + eps * xp.eye(Sigma_sym.shape[0]))
+        C = xp.linalg.cholesky(Sigma_sym + eps * xp.eye(Sigma_sym.shape[0], dtype=Sigma_sym.dtype))
     except xp.linalg.LinAlgError:
-        # project once, no extra +eps*I
         vals, vecs = xp.linalg.eigh(Sigma_sym)
         vals = xp.clip(vals, eps, None)
         Sigma_psd = vecs @ xp.diag(vals) @ vecs.T
         C = xp.linalg.cholesky(Sigma_psd)
-    return _np.asarray(C.T)   # ensure NumPy for CVXPY
+
+    # Explicit CuPy → NumPy conversion; avoid implicit __array__
+    if hasattr(C, "get"):          # CuPy
+        L_np = C.T.get()
+    else:                          # NumPy
+        L_np = _np.asarray(C.T)
+
+    return _np.ascontiguousarray(L_np, dtype=_np.float64)
 
 def _sigma_unconditional(
     R_df: pd.DataFrame,
@@ -574,9 +595,10 @@ def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sig
     mu_train_ann_assets    = AF * returns_train.mean(axis=0)
     sigma_train_ann_assets = xp.sqrt(AF) * returns_train.std(axis=0, ddof=1)
 
-    # exact constraint metric (matches solver): ||L w||_2 with L^T L ≈ Σ_ann
-    L = psd_factor_LtL(Sigma_ann, config["epsilon_sigma"])
-    risk_train_ann = float(xp.linalg.norm(L @ w))
+    # exact constraint metric (matches solver): ||L w||_2 with L^T L ≈ Σ_ann  
+    L = psd_factor_LtL(Sigma_ann, config["epsilon_sigma"])  # NumPy for CVXPY
+    L_xp = _to_xp(L)                                        # cast to xp for xp math
+    risk_train_ann = float(xp.linalg.norm(L_xp @ w))
     tol = max(atol, rtol * max(rho, risk_train_ann))
     ok_train = bool(risk_train_ann <= rho + tol)
 
@@ -769,9 +791,10 @@ def evaluate_portfolio(fit, data, G):
         # SOC (training) risk: ||L w||_2 where L^T L ≈ Σ_ann (if available)
         train_soc = float("nan")
         if isinstance(data, dict) and ("Sigma_ann_full" in data) and (data["Sigma_ann_full"] is not None):
-            L = psd_factor_LtL(data["Sigma_ann_full"], G["epsilon_sigma"])
-            train_soc = float(xp.linalg.norm(L @ fit["w"]))
-        
+            L = psd_factor_LtL(data["Sigma_ann_full"], G["epsilon_sigma"])  # NumPy for CVXPY
+            L_xp = _to_xp(L)                                                # cast to xp for xp math
+            train_soc = float(xp.linalg.norm(L_xp @ fit["w"]))
+     
         # enrich & rename “gap”
         stats_oos["gross_exp"] = ge
         stats_oos["sigma_train_ann"] = float(sigma_train_ann)
