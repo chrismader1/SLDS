@@ -319,30 +319,40 @@ def _to_xp(A):
 def psd_factor_LtL(Sigma, eps):
     """
     Return L such that Sigma ≈ L.T @ L (constraint ||L w|| ≤ rho).
-    Always return a NumPy float64, contiguous array for CVXPY.
-    Works on both NumPy and CuPy inputs.
+    Always returns a NumPy float64, contiguous array for CVXPY.
+    This version is *pure NumPy* end-to-end to avoid any implicit CuPy→NumPy conversion.
     """
     import numpy as _np
 
-    # Symmetrize
-    Sigma_sym = 0.5 * (Sigma + Sigma.T)
+    # ---- FORCE NUMPY INPUT ----
+    mod = getattr(Sigma, "__module__", "")
+    if hasattr(Sigma, "get"):              # CuPy ndarray
+        S = Sigma.get()
+    elif mod.startswith("cupy"):            # some CuPy-ish object without .get
+        try:
+            # xp is CuPy when GPU=True; asnumpy avoids implicit __array__
+            S = xp.asnumpy(Sigma)
+        except Exception:
+            # Last resort (shouldn’t normally hit)
+            S = _np.asarray(Sigma)
+    else:
+        S = _np.asarray(Sigma)
 
-    # Robust PSD + Cholesky on xp
+    S = _np.asarray(S, dtype=_np.float64, order="C")
+
+    # ---- NUMPY-ONLY FACTORIZATION ----
+    # Symmetrize & robustify
+    S_sym = 0.5 * (S + S.T)
     try:
-        C = xp.linalg.cholesky(Sigma_sym + eps * xp.eye(Sigma_sym.shape[0], dtype=Sigma_sym.dtype))
-    except xp.linalg.LinAlgError:
-        vals, vecs = xp.linalg.eigh(Sigma_sym)
-        vals = xp.clip(vals, eps, None)
-        Sigma_psd = vecs @ xp.diag(vals) @ vecs.T
-        C = xp.linalg.cholesky(Sigma_psd)
+        C = _np.linalg.cholesky(S_sym + float(eps) * _np.eye(S_sym.shape[0], dtype=S_sym.dtype))
+    except _np.linalg.LinAlgError:
+        vals, vecs = _np.linalg.eigh(S_sym)
+        vals = _np.clip(vals, float(eps), None)
+        S_psd = (vecs * vals) @ vecs.T
+        C = _np.linalg.cholesky(S_psd)
 
-    # Explicit CuPy → NumPy conversion; avoid implicit __array__
-    if hasattr(C, "get"):          # CuPy
-        L_np = C.T.get()
-    else:                          # NumPy
-        L_np = _np.asarray(C.T)
-
-    return _np.ascontiguousarray(L_np, dtype=_np.float64)
+    # Return L so that L^T L ≈ Σ : L = C^T (NumPy, contiguous, float64)
+    return _np.ascontiguousarray(C.T, dtype=_np.float64)
 
 def _sigma_unconditional(
     R_df: pd.DataFrame,
@@ -468,7 +478,8 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
         mc = float(mc)
         mc = max(0.0, min(1.0, mc))
         constr += [cp.sum(w) >= 1.0 - mc]
-        
+
+    '''
     prob = cp.Problem(objective, constr)
     try:
         if verbose:
@@ -479,7 +490,27 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
 
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         raise RuntimeError(f"ECOS/MOSEK failed: status={prob.status}")
+    '''
 
+    prob = cp.Problem(objective, constr)
+    try:
+        if verbose:
+            print(f"[solve_optimizer] delta={float(delta):.6g}, rho={rho:.6g} (solver=SCS, gpu)")
+        # Uses GPU iff CUDA-enabled SCS is installed; otherwise SCS ignores gpu=True.
+        prob.solve(solver=cp.SCS, verbose=False, gpu=True, max_iters=20000)
+    except Exception:
+        try:
+            if verbose:
+                print(f"[solve_optimizer] fallback → MOSEK (CPU)")
+            prob.solve(solver=cp.MOSEK, verbose=False)
+        except Exception:
+            if verbose:
+                print(f"[solve_optimizer] fallback → ECOS (CPU)")
+            prob.solve(solver=cp.ECOS, verbose=False)
+
+    if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
+        raise RuntimeError(f"SCS/MOSEK/ECOS failed: status={prob.status}")
+    
     return xp.asarray(_np.asarray(w.value).reshape(-1))
 
 
