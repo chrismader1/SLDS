@@ -534,13 +534,26 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
         constr += [cp.sum(w) >= 1.0 - mc]
 
     prob = cp.Problem(objective, constr)
+    try:
+        if verbose:
+            print(f"[solve_optimizer] delta = {float(delta):.6g}, rho = {rho:.6g}")
+        prob.solve(solver=cp.MOSEK, verbose=False)
+    except Exception:
+        prob.solve(solver=cp.ECOS, verbose=False)
+
+    if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
+        raise RuntimeError(f"ECOS/MOSEK failed: status={prob.status}")
+
+    '''  
+    prob = cp.Problem(objective, constr)
     if verbose:
         print(f"[solve_optimizer] delta={float(delta):.6g}, rho={rho:.6g} (solver=ECOS)")
     prob.solve(solver=cp.ECOS, verbose=False)
     
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         raise RuntimeError(f"ECOS failed: status={prob.status}")
-        
+    '''
+    
     return xp.asarray(_np.asarray(w.value).reshape(-1))
 
 # ---------------------------------------------------------------
@@ -1521,13 +1534,11 @@ def snap_start_prev(cal: pd.DatetimeIndex, start_dt):
     i = cal.searchsorted(s, side="right") - 1
     return cal[0] if i < 0 else cal[i]
 
-def _select_best_config(results_df, security, prefer_configs=None):
+def _select_best_config(results_df, security):
     """
-    For a given `security`:
-      (a) if `prefer_configs` provided → restrict to those config NAMES
-          (accept list of strings or list of dicts with 'config');
-      (b) else → use ALL rows for that security.
-    Then select by: score ↓, n_regimes ↑, dim_latent ↑ (sum if vector).
+    For a given `security`, select best row by:
+      score ↓, n_regimes ↑, dim_latent ↑ (sum if vector).
+    Caller must pre-filter `results_df` if preferences apply.
     Return the chosen `config` string (or None).
     """
     import numpy as np, pandas as pd, ast, re
@@ -1546,19 +1557,6 @@ def _select_best_config(results_df, security, prefer_configs=None):
     df = df[df["security"] == sec]
     if df.empty:
         return None
-
-    # (a) restrict to prefer_configs (by NAME) if provided
-    if prefer_configs:
-        names = []
-        for x in prefer_configs:
-            if isinstance(x, dict) and "config" in x:
-                names.append(str(x["config"]).strip())
-            else:
-                names.append(str(x).strip())
-        mask = df["config"].isin(names)
-        df = df[mask]
-        if df.empty:
-            return None  # nothing matches preferences
 
     # helpers to extract K and dim
     to_num = lambda x: pd.to_numeric(x, errors="coerce")
@@ -2036,7 +2034,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         for x in lst:
             names.append(str(x["config"] if isinstance(x, dict) and "config" in x else x).strip())
         return names
-    
+
     required = CONFIG.get("RSLDS", None)
     if not isinstance(required, (list, tuple)) or len(required) == 0:
         raise KeyError("CONFIG['RSLDS'] must be a non-empty list of required rSLDS configs.")
@@ -2051,13 +2049,17 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         raise RuntimeError(
             "results_csv is missing REQUIRED rSLDS config(s): "
             f"{missing}. Seen configs in results_csv: {sorted(seen)}")
-
+    
+    # restrict results to preferred configs once, then select per security
+    df_res_pref = df_res[df_res["config"].astype(str).str.strip().isin(required_configs)].copy()
+    
     for sec in px_cols:
-        cfg_best = _select_best_config(df_res, sec, prefer)
+        cfg_best = _select_best_config(df_res_pref, sec)  # two args only
         if cfg_best is None:
             print(f"[WARN] No winning config in results for {sec}; skipping.")
             continue
         z_ser = _labels_from_segments_df(df_seg, sec, cfg_best)
+    
         if z_ser is None:
             print(f"[WARN] No segments for {sec} under config={cfg_best}; skipping.")
             continue
