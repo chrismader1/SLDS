@@ -1493,17 +1493,21 @@ def _num_series(s):
 
 def map_labels_to_calendar(z_ser: pd.Series, cal: pd.DatetimeIndex) -> np.ndarray:
     """
-    Map labels only on exact matching dates in `cal`.
-    Returns a NumPy float64 array (never CuPy).
+    Map (and forward-fill) regime labels to a daily trading calendar.
+    Returns float64 array; NaN only before the first seen label.
     """
-    z = pd.Series(z_ser).sort_index()
-    z.index = pd.to_datetime(z.index)
+    z = pd.Series(z_ser).copy()
+    z.index = pd.to_datetime(z.index, errors="coerce")
+    z = z[~z.index.isna()].sort_index()
+
     cal = pd.DatetimeIndex(cal)
-    out = pd.Series(np.nan, index=cal)
-    inter = cal.intersection(z.index)
-    if len(inter):
-        out.loc[inter] = z.reindex(inter).to_numpy()
-    return out.to_numpy(dtype="float64")
+
+    # Reindex to full calendar and forward-fill *within* the calendar
+    # so all in-range dates (incl. the end date) carry the latest known label.
+    z_cal = z.reindex(cal).ffill()
+
+    # Keep NaN before the first known label; no forward-fill from “nothing”.
+    return z_cal.to_numpy(dtype="float64")
 
 def snap_start_prev(cal: pd.DatetimeIndex, start_dt):
     """
