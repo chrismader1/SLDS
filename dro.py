@@ -1008,14 +1008,30 @@ def _max_drawdown_from_series(port_daily):
     """
     Max drawdown of a daily-return series.
     Returns the minimum (most negative) drawdown, e.g. -0.27 for -27%.
+    Uses NumPy fallback for prefix-maximum on GPU (CuPy lacks maximum.accumulate).
     """
     x = xp.asarray(port_daily, float)
     if x.size == 0:
         return float("nan")
-    equity = xp.cumprod(1.0 + x)
-    peak = xp.maximum.accumulate(equity)
-    dd = equity / peak - 1.0
-    return float(xp.min(dd))
+
+    # If we're on GPU, do the cumprod + running-max on NumPy, then compute dd there.
+    try:
+        import cupy as _cp
+        is_gpu = isinstance(x, _cp.ndarray) or hasattr(x, "__cuda_array_interface__")
+    except Exception:
+        is_gpu = False
+
+    if is_gpu:
+        x_np = asnumpy_strict(x, dtype=float)
+        equity_np = np.cumprod(1.0 + x_np)
+        peak_np = np.maximum.accumulate(equity_np)
+        dd_np = equity_np / peak_np - 1.0
+        return float(np.min(dd_np))
+    else:
+        equity = np.cumprod(1.0 + np.asarray(x, dtype=float))
+        peak = np.maximum.accumulate(equity)
+        dd = equity / peak - 1.0
+        return float(np.min(dd))
 
 def portfolio_stats(weights, returns, config):
     """
