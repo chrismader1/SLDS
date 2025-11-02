@@ -470,10 +470,6 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     Sigma_np = asnumpy_strict(Sigma, dtype=_np.float64, order="C")
     _np.nan_to_num(Sigma_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-
-    # ---- Strict NumPy boundary for CVXPY ----
-    Sigma_np = asnumpy_strict(Sigma, dtype=_np.float64, order="C")
-    
     # Absolute guard (even if asnumpy_strict ever regresses)
     try:
         import cupy as _cp
@@ -544,16 +540,6 @@ def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
         raise RuntimeError(f"ECOS/MOSEK failed: status={prob.status}")
 
-    '''  
-    prob = cp.Problem(objective, constr)
-    if verbose:
-        print(f"[solve_optimizer] delta={float(delta):.6g}, rho={rho:.6g} (solver=ECOS)")
-    prob.solve(solver=cp.ECOS, verbose=False)
-    
-    if (w.value is None) or (prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)):
-        raise RuntimeError(f"ECOS failed: status={prob.status}")
-    '''
-    
     return xp.asarray(_np.asarray(w.value).reshape(-1))
 
 # ---------------------------------------------------------------
@@ -1536,73 +1522,55 @@ def snap_start_prev(cal: pd.DatetimeIndex, start_dt):
 
 def _select_best_config(results_df, security):
     """
-    For a given `security`, select best row by:
-      score ↓, n_regimes ↑, dim_latent ↑ (sum if vector).
-    Caller must pre-filter `results_df` if preferences apply.
-    Return the chosen `config` string (or None).
+    For a given `security`, select BEST tuple among rows already limited to
+    PERMISSIBLE tuples. Sort: score ↓, n_regimes ↑, dim_latent ↑.
+    Returns (config, n_regimes, dim_latent) or None.
     """
-    import numpy as np, pandas as pd, ast, re
+    import numpy as np, pandas as pd
 
     if results_df is None or len(results_df) == 0:
         return None
-    if "security" not in results_df.columns or "config" not in results_df.columns:
+    need = {"security","config","n_regimes","dim_latent"}
+    if not need.issubset(results_df.columns):
         return None
 
     df = results_df.copy()
-    df["security"] = df["security"].astype(str).str.strip()
-    df["config"]   = df["config"].astype(str).str.strip()
+    df["security"]   = df["security"].astype(str).str.strip()
+    df["config"]     = df["config"].astype(str).str.strip()
+    df["n_regimes"]  = pd.to_numeric(df["n_regimes"],  errors="coerce").astype("Int64")
+    df["dim_latent"] = pd.to_numeric(df["dim_latent"], errors="coerce").astype("Int64")
+    df["score_num"]  = pd.to_numeric(df.get("score", np.nan), errors="coerce")
 
-    # filter by security
-    sec = str(security).strip()
-    df = df[df["security"] == sec]
+    df = df[df["security"] == str(security).strip()]
     if df.empty:
         return None
 
-    # helpers to extract K and dim
-    to_num = lambda x: pd.to_numeric(x, errors="coerce")
-
-    def parse_K(row):
-        for kcol in ("n_regimes","K","k","nStates","n_states"):
-            if kcol in row and pd.notna(row[kcol]):
-                return to_num(row[kcol])
-        m = re.search(r"[Kk]\s*=?\s*(\d+)", str(row.get("config","")))
-        return float(m.group(1)) if m else np.nan
-
-    def dim_metric(row):
-        v = row.get("dim_latent", np.nan)
-        if isinstance(v, str):
-            try: v = ast.literal_eval(v)
-            except Exception: pass
-        if isinstance(v, (list, tuple)):
-            s = pd.to_numeric(pd.Series(v), errors="coerce").dropna()
-            return float(s.sum()) if len(s) else xp.nan
-        return float(to_num(v))
-
-    df["score_num"] = to_num(df.get("score", xp.nan))
-    df["K_num"]     = [parse_K(r)    for _, r in df.iterrows()]
-    df["D_num"]     = [dim_metric(r) for _, r in df.iterrows()]
-
-    df = df.sort_values(["score_num","K_num","D_num"],
-                        ascending=[False, True, True],
-                        na_position="last")
-
-    if df.empty or pd.isna(df.iloc[0]["score_num"]):
+    df = df.sort_values(
+        ["score_num","n_regimes","dim_latent"],
+        ascending=[False, True, True], na_position="last"
+    )
+    r0 = df.iloc[0]
+    if pd.isna(r0.get("score_num")):
         return None
-    return str(df.iloc[0]["config"])
+    return (str(r0["config"]), int(r0["n_regimes"]), int(r0["dim_latent"]))
 
-def _labels_from_segments_df(segments_df, security, config):
-    df = segments_df[(segments_df["security"] == security) &
-                     (segments_df["config"] == config)].copy()
+def _labels_from_segments_df(segments_df, security, config, n_regimes, dim_latent):
+    df = segments_df.copy()
+    df["security"] = df["security"].astype(str).str.strip()
+    df["config"]   = df["config"].astype(str).str.strip()
+    # strict tuple filter
+    df = df[
+        (df["security"] == str(security).strip()) &
+        (df["config"]   == str(config).strip()) &
+        (pd.to_numeric(df["n_regimes"],  errors="coerce").astype("Int64") == int(n_regimes)) &
+        (pd.to_numeric(df["dim_latent"], errors="coerce").astype("Int64") == int(dim_latent))
+    ]
     if df.empty:
         return None
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.sort_values(["date", "z"])
-    # keep the last label for a duplicated date (choose policy if you want 'first')
-    df = df.drop_duplicates(subset="date", keep="last")
-    return pd.Series(
-        df["z"].astype(int).to_numpy(),
-        index=pd.DatetimeIndex(df["date"]),
-        name="z",)
+    df = df.sort_values(["date", "z"]).drop_duplicates(subset="date", keep="last")
+    return pd.Series(df["z"].astype(int).to_numpy(),
+                     index=pd.DatetimeIndex(df["date"]), name="z")
 
 def _all_zero_weights(w, tol=1e-12) -> bool:
     w = xp.asarray(w, float).ravel()
@@ -1879,6 +1847,51 @@ def _period_ends(idx: pd.DatetimeIndex, freq: str = "M") -> pd.DatetimeIndex:
     """Return last available date per period on `idx` (e.g., month-end on trading calendar)."""
     return pd.DatetimeIndex(pd.Series(idx).groupby(idx.to_period(freq)).max())
 
+def _available_cfg_tuples_from_parquet(seg_parq: str) -> set[tuple[str, int, int]]:
+    """
+    Read available (config, n_regimes, dim_latent) tuples from segments parquet.
+    """
+    seg = pd.read_parquet(seg_parq, columns=["config","n_regimes","dim_latent"])
+    seg["config"]     = seg["config"].astype(str).str.strip()
+    seg["n_regimes"]  = pd.to_numeric(seg["n_regimes"],  errors="raise").astype(int)
+    seg["dim_latent"] = pd.to_numeric(seg["dim_latent"], errors="raise").astype(int)
+    tups = set(seg[["config","n_regimes","dim_latent"]]
+               .drop_duplicates()
+               .itertuples(index=False, name=None))
+    return tups
+
+def _permissible_tuples_from_CONFIG(CONFIG) -> list[tuple[str,int,int]]:
+    """
+    Build all permissible (config, n_regimes, dim_latent) tuples from CONFIG["RSLDS"].
+    Each entry must be a dict with those three keys.
+    """
+    lst = CONFIG.get("RSLDS", [])
+    if not isinstance(lst, (list, tuple)) or len(lst) == 0:
+        raise ValueError("CONFIG['RSLDS'] must be a non-empty list of dicts.")
+    out = []
+    for x in lst:
+        if not isinstance(x, dict) or not all(k in x for k in ("config","n_regimes","dim_latent")):
+            raise ValueError("Each RSLDS entry must be a dict with keys: config, n_regimes, dim_latent.")
+        out.append((str(x["config"]).strip(), int(x["n_regimes"]), int(x["dim_latent"])))
+    return out
+
+def _tuples_in_results_csv(df_res, tuples: list[tuple[str,int,int]]) -> set[tuple[str,int,int]]:
+    """
+    Return the subset of tuples present in results_csv.
+    """
+    import pandas as pd, numpy as np
+    df = df_res.copy()
+    df["config"]     = df["config"].astype(str).str.strip()
+    df["n_regimes"]  = pd.to_numeric(df.get("n_regimes", np.nan),  errors="coerce").astype("Int64")
+    df["dim_latent"] = pd.to_numeric(df.get("dim_latent", np.nan), errors="coerce").astype("Int64")
+    seen = set()
+    for _, r in df.iterrows():
+        c = str(r["config"])
+        K = r["n_regimes"]; D = r["dim_latent"]
+        if pd.notna(K) and pd.notna(D):
+            seen.add((c, int(K), int(D)))
+    return {t for t in tuples if t in seen}
+
 # -------------------------
 # Pipeline
 # -------------------------
@@ -2026,46 +2039,51 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         full_index=full_index, R_df=R_oos,
         delay=k_delay, tc=tc, name="DRO_daily",)
 
+    # --- rSLDS: build permissible tuples, verify in results_csv, pick BEST tuple per security ---
     Z_labels     = {}
-    Z_labels_fit = {}  # labels on the FIT calendar (includes pre-start history)
+    Z_labels_fit = {}
     
-    def _required_config_names(lst):
-        names = []
-        for x in lst:
-            names.append(str(x["config"] if isinstance(x, dict) and "config" in x else x).strip())
-        return names
-
-    required = CONFIG.get("RSLDS", None)
-    if not isinstance(required, (list, tuple)) or len(required) == 0:
-        raise KeyError("CONFIG['RSLDS'] must be a non-empty list of required rSLDS configs.")
+    # 3.1 permissible tuples from CONFIG
+    perm_tuples = _permissible_tuples_from_CONFIG(CONFIG)  # list of (config,K,D)
     
-    required_configs = _required_config_names(required)
-    
-    avail_cfgs = df_res["config"].astype(str).str.strip()
-    seen = set(avail_cfgs)
-    
-    missing = sorted(set(required_configs) - seen)
+    # 3.2 hard-check that ALL permissible tuples exist in results_csv
+    present = _tuples_in_results_csv(df_res, perm_tuples)
+    missing = sorted(set(perm_tuples) - present)
     if missing:
         raise RuntimeError(
-            "results_csv is missing REQUIRED rSLDS config(s): "
-            f"{missing}. Seen configs in results_csv: {sorted(seen)}")
+            "results_csv is missing REQUIRED rSLDS tuples: "
+            f"{missing}"
+        )
     
-    # restrict results to preferred configs once, then select per security
-    df_res_pref = df_res[df_res["config"].astype(str).str.strip().isin(required_configs)].copy()
+    # 3.3 restrict results to permissible tuples only (exact match on name,K,D)
+    df_res_perm = df_res.copy()
+    df_res_perm["config"]     = df_res_perm["config"].astype(str).str.strip()
+    df_res_perm["n_regimes"]  = pd.to_numeric(df_res_perm["n_regimes"],  errors="coerce").astype("Int64")
+    df_res_perm["dim_latent"] = pd.to_numeric(df_res_perm["dim_latent"], errors="coerce").astype("Int64")
+    mask_perm = pd.Series(False, index=df_res_perm.index)
+    perm_set = set(perm_tuples)
+    mask_perm |= df_res_perm.apply(
+        lambda r: (str(r["config"]), int(r["n_regimes"]) if pd.notna(r["n_regimes"]) else -1,
+                   int(r["dim_latent"]) if pd.notna(r["dim_latent"]) else -1) in perm_set,
+        axis=1
+    )
+    df_res_perm = df_res_perm[mask_perm]
     
+    # 3.4 for each security, choose BEST tuple and load labels STRICTLY by that tuple
     for sec in px_cols:
-        cfg_best = _select_best_config(df_res_pref, sec)  # two args only
-        if cfg_best is None:
-            print(f"[WARN] No winning config in results for {sec}; skipping.")
+        best = _select_best_config(df_res_perm, sec)  # returns (config,K,D) or None
+        if best is None:
+            print(f"[WARN] No winning tuple in results for {sec}; skipping.")
             continue
-        z_ser = _labels_from_segments_df(df_seg, sec, cfg_best)
+        c_name, K, D = best
     
+        # labels must match exact tuple; function already enforces tuple match
+        z_ser = _labels_from_segments_df(df_seg, sec, c_name, K, D)
         if z_ser is None:
-            print(f"[WARN] No segments for {sec} under config={cfg_best}; skipping.")
+            print(f"[WARN] No segments for {sec} under {(c_name,K,D)}; skipping.")
             continue
-        # keep OOS-mapped labels for union breaks and display
+    
         Z_labels[sec]     = map_labels_to_calendar(z_ser, full_index)
-        # labels mapped to FIT calendar for conditioning inside lookback windows
         Z_labels_fit[sec] = map_labels_to_calendar(z_ser, full_index_fit)
     
     avail = [t for t in px_cols if t in Z_labels]

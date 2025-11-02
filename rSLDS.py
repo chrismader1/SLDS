@@ -429,7 +429,6 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
     return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_last, mdl
 
 
-
 # ---------------------------------------------------------------
 # Load rSLDS (parameters pre-determined)
 # ---------------------------------------------------------------
