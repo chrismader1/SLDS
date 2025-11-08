@@ -1461,35 +1461,6 @@ def evaluate_rSLDS_actual(y, px, zhat, xhat, elbo, mdl, cpll, max_cpll, dt, disp
     if display:
 
         print_rSLDS_matrices(mdl)
-        
-        n_panels = 5 if elbo is not None else 4
-        fig, axes = plt.subplots(n_panels, 1, figsize=(8, 1.5 * n_panels), sharex=False)
-
-        # Panel 0: Performance
-        axes[0].plot(px.index, bench_index, label="Benchmark index")
-        axes[0].plot(px.index, strategy_index, label="Strategy index")
-        for regime in np.unique(zhat):
-            m = (zhat == regime)
-            axes[0].fill_between(px.index, bench_index.min(), bench_index.max(), where=m, alpha=0.2, label=f"Regime {regime}")
-        axes[0].set_ylabel("Performance Index"); axes[0].legend()
-
-        # Panel 1: Observed price
-        axes[1].plot(px.index, px, label="Observed Price"); axes[1].set_ylabel("Observed Price"); axes[1].legend()
-
-        # Panel 2: Observed y_t
-        axes[2].plot(px.index, y, label=r"Observed $y_t$"); axes[2].set_ylabel(r"Observed $y_t$"); axes[2].legend()
-
-        # Panel 3: Inferred regimes
-        axes[3].step(px.index, zhat, where="mid", label="Inferred", color="red", alpha=0.7)
-        axes[3].set_ylabel("Regime"); axes[3].legend()
-
-        # Panel 4: ELBO
-        if elbo is not None:
-            elbo_flat = np.concatenate(elbo)
-            axes[4].plot(np.arange(len(elbo_flat)), elbo_flat, label="ELBO")
-            axes[4].set_xlabel("EM iteration (all batches)"); axes[4].set_ylabel("ELBO"); axes[4].legend()
-
-        plt.tight_layout(); plt.show()
 
         # Summary print (mirror synthetic style)
         print("\n========== EVALUATION SUMMARY ==========")
