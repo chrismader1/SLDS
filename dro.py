@@ -1216,7 +1216,7 @@ def hypothesis_tests(results_dict, tests, alpha=0.05):
                 print("   Conclusion: FAIL TO REJECT H0 — No significant Sharpe improvement detected.")
 
 # ---------------------------------------------------------------
-# Subsampling bootstrap
+# Jackknife universe resampling
 # ---------------------------------------------------------------
 
 def _aggregate_ci(samples: dict[str, list[float]], alpha: float) -> dict[str, dict]:
@@ -1265,77 +1265,89 @@ def _aggregate_mean_std(samples: dict[str, list[float]]) -> dict[str, dict]:
                 "std":  float(np.std(good, ddof=1)) if good.size > 1 else np.nan,
             }
     return out
-
-def bootstrap_universe_oos(
+    
+def jackknife_universe_oos(
     *,
     securities: list[str],
     CONFIG: dict,
-    B: int = 100,
-    p: float = 0.8,
+    d: int,
     alpha: float = 0.05,
     seed: int | None = None,
 ) -> dict[str, dict[str, dict]]:
     """
-    GPU-accelerated subset sampling + CI aggregation.
-    Pipeline run remains CPU-bound; I/O removed via artifacts cache.
-    Also returns bootstrap mean and std for each metric.
+    Leave-d-out jackknife over the security universe.
+
+    CONFIG["JACKKNIFE"]: {"d": <block size>, "seed": <int>}
+    - n = len(securities)
+    - require n % d == 0
+    - permute securities once
+    - for each block b, drop that block, run dro_pipeline on remaining names
+    - aggregate metrics across jackknife samples (quantiles + mean/std)
     """
     artifacts = _load_artifacts_cached(CONFIG)
 
-    # mark bootstrap context for dro_pipeline printing control
-    CONFIG["__bootstrap_run"] = {"active": True, "B": int(B), "i": 0}
-
     names = [str(x) for x in securities]
     n = int(len(names))
-    m = int(max(1, xp.floor(float(p) * n)))
+    d = int(d)
 
-    # pre-generate B subsets
-    if GPU:
-        xp.random.seed(seed if seed is not None else 0)
-        R = xp.random.random((int(B), n))
-        perm = xp.argsort(R, axis=1)
-        subs = perm[:, :m]  # (B,m)
-    else:
-        rng = np.random.default_rng(seed)
-        subs = np.vstack([rng.permutation(n)[:m] for _ in range(int(B))])
+    if d <= 0:
+        raise ValueError("JACKKNIFE['d'] must be positive.")
+    if n == 0:
+        raise ValueError("No securities provided for jackknife.")
+    if n % d != 0:
+        raise ValueError(f"Jackknife requires n % d == 0; got n={n}, d={d}.")
+
+    n_blocks = n // d
+    rng = np.random.default_rng(seed)
+
+    # Single permutation used to define disjoint leave-d-out blocks
+    perm_idx = rng.permutation(n)
+
+    # Mark context so dro_pipeline suppresses repeated tables
+    CONFIG["__bootstrap_run"] = {"active": True, "B": int(n_blocks), "i": 0}
 
     METRICS = [
         "mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
         "alpha_ann","te_ann","ir_ann","hit_rate","gross_exp",
         "delta_mean","delta_min","delta_max",
     ]
-    buckets = {s: {k: [] for k in METRICS} for s in ("MVO","DRO","RegDRO")}
+    buckets = {s: {k: [] for k in METRICS} for s in ("MVO", "DRO", "RegDRO")}
 
-    for b in range(int(B)):
-        idx_b = subs[b].get() if GPU else subs[b]
-        subset = [names[int(i)] for i in idx_b]
+    for b in range(n_blocks):
+        start = b * d
+        end = start + d
 
-        # progress print per run
+        left_out_idx = perm_idx[start:end]
+        left_out = {names[int(i)] for i in left_out_idx}
+        jackknife_sec = [s for s in names if s not in left_out]
+
         print()
-        print(72*"=")
-        print(f"[bootstrap] run {b+1}/{B}, subset={len(subset)}")
-        print(72*"=")
+        print("=" * 72)
+        print(f"[jackknife] block {b+1}/{n_blocks}, left_out={len(left_out)}, kept={len(jackknife_sec)}")
+        print("=" * 72)
         print()
 
         CONFIG["__bootstrap_run"]["i"] = int(b)
+
         res = dro_pipeline(
-            subset,
+            jackknife_sec,
             CONFIG,
             verbose=False,
-            run_bootstrap=False,   # avoid recursion
+            run_bootstrap=False,   # prevent recursion
             artifacts=artifacts,
         )
-        for strat in ("MVO","DRO","RegDRO"):
+
+        for strat in ("MVO", "DRO", "RegDRO"):
             row = res[strat]["summary"]
             for k in METRICS:
                 buckets[strat][k].append(float(row.get(k, np.nan)))
-    
+
     # cleanup context
     CONFIG.pop("__bootstrap_run", None)
 
-    # percentile CIs
+    # percentile-style intervals from jackknife replicates
     ci = {s: _aggregate_ci_xp(buckets[s], alpha) for s in buckets}
-    # mean/std across runs
+    # mean/std across jackknife samples
     ms = {s: _aggregate_mean_std(buckets[s]) for s in buckets}
 
     return {"ci": ci, "mean_std": ms}
@@ -2326,21 +2338,24 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     rows_dro["hit_rate"] = _hit_rate(dro_daily, spx_daily)
     rows_reg["hit_rate"] = _hit_rate(regdro_daily, spx_daily)
     # SPX left blank by rule
+    
+    # --- Jackknife (strategies only) ---
+    if run_jackknife:
+        JK = dict(CONFIG.get("JACKKNIFE", {}))
+        d_jk    = int(JK.get("d", 0))
+        seed_jk = JK.get("seed", None)
+        if d_jk <= 0:
+            raise ValueError("CONFIG['JACKKNIFE']['d'] must be set and positive.")
 
-    # --- Bootstraps (strategies only) ---
-    if run_bootstrap:
-        BS = dict(CONFIG.get("BOOTSTRAP", {}))
-        B_boot   = int(BS.get("B", 100))
-        p_keep   = float(BS.get("p", 0.80))
-        alpha_ci = float(BS.get("alpha", 0.05))
-        seed_bs  = BS.get("seed", None)
-
-        bb = bootstrap_universe_oos(
-            securities=names_all, CONFIG=CONFIG,
-            B=B_boot, p=p_keep, alpha=alpha_ci, seed=seed_bs,
+        bb = jackknife_universe_oos(
+            securities=names_all,
+            CONFIG=CONFIG,
+            d=d_jk,
+            alpha=0.05,      # fixed confidence level for intervals
+            seed=seed_jk,
         )
-
-        # apply percentile CIs
+        
+        # apply jackknife-based intervals
         def _apply_ci(rows: dict, ci_dict: dict):
             for k, trip in ci_dict.items():
                 if k in rows:
@@ -2352,7 +2367,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
         rows_dro = _apply_ci(rows_dro, bb["ci"]["DRO"])
         rows_reg = _apply_ci(rows_reg, bb["ci"]["RegDRO"])
 
-        # optional: expose mean/std across bootstrap runs
+        # mean/std across jackknife samples
         def _apply_ms(rows: dict, ms_dict: dict):
             for k, ms in ms_dict.items():
                 if k in rows:
