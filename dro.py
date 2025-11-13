@@ -363,24 +363,32 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         return float(max(base, 1e-12) ** expo)
 
     if method == "bootstrap_np":
-        alpha  = float((params or {}).get("alpha", 0.05))
-        B      = int((params or {}).get("B", 256))
-        n_proj = int((params or {}).get("n_proj", 128))
-        seed   = (params or {}).get("seed", None)
-        L      = int((params or {}).get("block_len", 10))  # fixed 10 by default
-        delta_daily = bootstrap_np_block_delta(R, n_proj=n_proj, B=B, block_len=L, alpha=alpha, seed=seed)
-        return AF * float(delta_daily)
+        alpha       = float((params or {}).get("alpha", 0.05))
+        B           = int((params or {}).get("B", 256))
+        n_proj      = int((params or {}).get("n_proj", 128))
+        seed        = (params or {}).get("seed", None)
+        L           = int((params or {}).get("block_len", 10))
+        n_sample    = int((params or {}).get("n_sample", 252))
+        standardize = bool((params or {}).get("standardize", True))
+        delta_daily = bootstrap_np_block_delta(
+            R, n_proj=n_proj, B=B, block_len=L, alpha=alpha, seed=seed,
+            n_sample=n_sample, standardize=standardize,)
+        return float(np.sqrt(AF)) * float(delta_daily)
     
     if method == "bootstrap_gaussian":
         assert R is not None, "bootstrap_gaussian needs raw sample matrix R."
-        alpha = float((params or {}).get("alpha", 0.05))
-        B     = int((params or {}).get("B", 512))
-        eps   = float((params or {}).get("epsilon_sigma", 1e-9))
-        seed  = (params or {}).get("seed", None)
-        L     = int((params or {}).get("block_len", 10))  # fixed 10 by default
-        delta_daily = bootstrap_gaussian_block_delta(R, alpha=alpha, B=B, block_len=L, eps=eps, seed=seed)
-        return AF * float(delta_daily)
-    
+        alpha       = float((params or {}).get("alpha", 0.05))
+        B           = int((params or {}).get("B", 512))
+        eps         = float((params or {}).get("epsilon_sigma", 1e-9))
+        seed        = (params or {}).get("seed", None)
+        L           = int((params or {}).get("block_len", 10))
+        n_sample    = int((params or {}).get("n_sample", 252))
+        standardize = bool((params or {}).get("standardize", True))
+        delta_daily = bootstrap_gaussian_block_delta(
+            R, alpha=alpha, B=B, block_len=L, eps=eps, seed=seed,
+            n_sample=n_sample, standardize=standardize,)    
+    return float(np.sqrt(AF)) * float(delta_daily)
+
     raise ValueError(f"Unknown delta_method='{method}'")
 
 def _to_xp(A):
@@ -2224,15 +2232,11 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
     _cap_skips = 0
     _cap_total = len(taus) - 1
     for a, b in zip(taus[:-1], taus[1:]):
-        
-        t_mid = min(max(a, 0), len(full_index) - 1)
-        D     = full_index[t_mid]                    # decision date on OOS calendar
-        D_pos = full_index_fit.get_loc(D)            # corresponding position on FIT calendar
 
         # Current decision date on OOS calendar and its position on the FIT calendar
         t_mid = min(max(a, 0), len(full_index) - 1)
-        D     = full_index[t_mid]
-        D_pos = full_index_fit.get_loc(D)
+        D     = full_index[t_mid]                    # decision date on OOS calendar
+        D_pos = full_index_fit.get_loc(D)            # corresponding position on FIT calendar
 
         # Lookback window on FIT calendar: [D_pos - lookback, D_pos)
         a_win = max(0, D_pos - lookback)
@@ -2405,23 +2409,11 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
         rows_dro["delta_min"]  = float(d.min())  if len(d) else np.nan
         rows_dro["delta_max"]  = float(d.max())  if len(d) else np.nan
 
-    '''
     if len(fit_reg.get("delta_list", [])):
         d = pd.Series([float(x) for x in fit_reg["delta_list"] if np.isfinite(x)])
         rows_reg["delta_mean"] = float(d.mean()) if len(d) else np.nan
         rows_reg["delta_min"]  = float(d.min())  if len(d) else np.nan
         rows_reg["delta_max"]  = float(d.max())  if len(d) else np.nan
-    '''
-
-    # BEG OF NEW
-
-    if len(fit_reg.get("delta_list", [])):
-        d = pd.Series([float(x) for x in fit_reg["delta_list"] if np.isfinite(x)])
-        rows_reg["delta_mean"] = float(d.mean()) if len(d) else np.nan
-        rows_reg["delta_min"]  = float(d.min())  if len(d) else np.nan
-        rows_reg["delta_max"]  = float(d.max())  if len(d) else np.nan
-
-    # --- NEW: delta decomposition diagnostics shown in OOS summary ---
 
     # initialize to NaN for all four strategies
     for rows in (rows_mvo, rows_spx, rows_dro, rows_reg):
@@ -2433,6 +2425,19 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
     lam    = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
     min_lb = int(CONFIG["REBAL"]["min_lookback_days"])
 
+    # --- guards (no try/except) ---
+    def _ok_panel(R_df, min_obs):
+        X = R_df.to_numpy(float)
+        row_ok = np.isfinite(X).all(axis=1)
+        return int(row_ok.sum()) >= int(min_obs)
+    
+    def _segment_lengths_ok(taus_vec):
+        K = max(0, len(taus_vec) - 1)
+        if K <= 0:
+            return False, np.array([], dtype=int)
+        seg_lengths = np.diff(np.array(taus_vec, dtype=int))
+        return bool(np.all(seg_lengths > 0)), seg_lengths
+    
     # Helper: pooled delta on a panel R_df with the same delta config
     def _pooled_delta(R_df, params_delta):
         mask_all = np.ones(R_df.shape[0], dtype=bool)
@@ -2444,80 +2449,71 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
                              params=params_delta)
 
     # 2.1 DRO: δ_pooled on the unconditional OOS panel (matching the DRO asset set)
-    try:
+    if _ok_panel(R_oos, min_lb):
         rows_dro["delta_pooled"] = float(_pooled_delta(R_oos, params_dro))
-    except Exception:
+    else:
         rows_dro["delta_pooled"] = float("nan")
 
     # 2.2 RegDRO: δ_pooled, δ_within, δ_between (on the RegDRO asset set)
-    try:
-        # use the RegDRO panel and segments already defined above
-        R_reg_df = R_reg  # (OOS window, names_all)
-        params_reg_local = dict(params_reg)
-
-        # δ_pooled (same method as DRO but on the RegDRO asset set)
+    R_reg_df = R_reg  # (OOS window, names_all)
+    params_reg_local = dict(params_reg)
+    
+    # δ_pooled (same method as DRO but on the RegDRO asset set)
+    if _ok_panel(R_reg_df, min_lb):
         rows_reg["delta_pooled"] = float(_pooled_delta(R_reg_df, params_reg_local))
+    else:
+        rows_reg["delta_pooled"] = float("nan")
+    
+    # segment length checks
+    ok_segs, seg_lengths = _segment_lengths_ok(taus)
+    
+    if ok_segs:
+        total_len = float(seg_lengths.sum())
+        pi = seg_lengths / total_len if total_len > 0 else np.zeros_like(seg_lengths, dtype=float)
 
-        # weights π_k by OOS segment length
-        seg_lengths = np.diff(np.array(taus, dtype=int))
-        total_len   = float(seg_lengths.sum())
-        if total_len <= 0:
-            raise RuntimeError("Empty regime segmentation on OOS window.")
-        pi = seg_lengths / total_len
-
-        # Decide which ground W₂ to use for 'between'
         method = str(params_reg_local.get("delta_method", "bootstrap_np")).lower()
         use_gaussian = ("gaussian" in method)
         n_proj = int(params_reg_local.get("n_proj", 128))
 
-        # δ_within: per-segment bootstrap δ_k then combine in quadrature
-        delta_k = []
-        for (a_, b_) in zip(taus[:-1], taus[1:]):
+        # ---- δ_within (permit short segments; renormalize π to the kept set) ----
+        delta_k, pi_valid = [], []
+        for (a_, b_), w_k in zip(zip(taus[:-1], taus[1:]), pi):
             Xk_df = R_reg_df.iloc[a_:b_, :]
-            # guard short segments: allowed because compute_delta uses MBB
-            mu_k  = compute_mean_from_window(Xk_df, np.ones(len(Xk_df), dtype=bool),
-                                             min_obs=min_lb, ann=AF)
-            Sig_k = compute_cov_from_window(Xk_df, ann=AF, shrink_lambda=lam, min_obs=min_lb)
-            dk    = compute_delta(params_reg_local.get("kappa", 1.0),
-                                  mu_k, Sig_k,
-                                  R=Xk_df.to_numpy(float),
-                                  params=params_reg_local)
-            delta_k.append(float(dk))
-        rows_reg["delta_within"] = float(np.sqrt(np.sum(pi * (np.asarray(delta_k)**2))))
-
-        # δ_between: pairwise W₂ between segment empirical distributions
-        # (same distance family as above; scale to match δ units by AF)
-        def _pairwise_w2(i, j):
-            Xi = R_reg_df.iloc[taus[i]:taus[i+1], :].to_numpy(float)
-            Xj = R_reg_df.iloc[taus[j]:taus[j+1], :].to_numpy(float)
-            if use_gaussian:
-                mui = np.mean(Xi, axis=0);    Si = np.cov(Xi.T, ddof=1)
-                muj = np.mean(Xj, axis=0);    Sj = np.cov(Xj.T, ddof=1)
-                dij = wasserstein2_gaussian(mui, Si, muj, Sj)
+            seg_n = int(Xk_df.shape[0])
+            if seg_n < 2:
+                continue
+        
+            # Require at least 2 all-finite rows to satisfy estimators without try/except
+            Xk = Xk_df.to_numpy(float)
+            row_ok = np.isfinite(Xk).all(axis=1)
+            if int(row_ok.sum()) < 2:
+                continue
+        
+            if method.startswith("bootstrap"):
+                # For bootstrap_* methods μ,Σ are placeholders (ignored by compute_delta)
+                mu_k  = np.zeros(Xk_df.shape[1], dtype=float)
+                Sig_k = np.eye(Xk_df.shape[1], dtype=float)
             else:
-                dij = sliced_w2_empirical(Xi, Xj, n_proj=n_proj, rng=None)
-            # match the scale used by compute_delta (bootstrap_* returns AF * daily-distance)
-            return float(AF * dij)
+                # Use only all-finite rows
+                mu_k  = compute_mean_from_window(Xk_df, row_ok, min_obs=2, ann=AF)
+                Sig_k = compute_cov_from_window(Xk_df.loc[row_ok], ann=AF, shrink_lambda=lam, min_obs=2)
+        
+            dk = compute_delta(
+                params_reg_local.get("kappa", 1.0),
+                mu_k, Sig_k,
+                R=Xk_df.to_numpy(float),
+                params=params_reg_local
+            )
+        
+            if np.isfinite(dk):
+                delta_k.append(float(dk))
+                pi_valid.append(float(w_k))
+        
+        if len(delta_k) >= 1 and np.sum(pi_valid) > 0:
+            pi_valid = np.asarray(pi_valid, float)
+            pi_valid = pi_valid / float(np.sum(pi_valid))
+            rows_reg["delta_within"] = float(np.sqrt(np.sum(pi_valid * (np.asarray(delta_k) ** 2))))
 
-        D2 = 0.0
-        K  = len(taus) - 1
-        for i in range(K):
-            for j in range(i+1, K):
-                dij = _pairwise_w2(i, j)
-                D2 += 2.0 * float(pi[i]) * float(pi[j]) * (dij ** 2)
-        rows_reg["delta_between"] = float(np.sqrt(max(D2, 0.0)))
-
-        # Composite check
-        w_ = rows_reg["delta_within"]; b_ = rows_reg["delta_between"]
-        rows_reg["delta_within_between"] = float(np.sqrt((w_*w_) + (b_*b_)))
-    except Exception:
-        # leave NaNs if anything fails; table still renders
-        pass
-
-    # Bench-relative point estimates (only for strategy columns)
-
-
-    # END OF NEW 
     # Bench-relative point estimates (only for strategy columns)
     def _bench_stats(port, bench, AF=252):
         ex = (port - bench).dropna()
