@@ -216,51 +216,92 @@ def _mbb_indices(T: int, m: int, L: int, rng=None) -> np.ndarray:
         filled += k
     return idx
 
-def bootstrap_np_block_delta(R, n_proj=128, B=256, block_len=10, alpha=0.05, seed=None):
+def bootstrap_np_block_delta(
+    R, n_proj=128, B=100, block_len=21, alpha=0.05, seed=None, n_sample=252,
+    standardize=True):
     """
-    10-day moving-block bootstrap of the empirical daily panel.
-    Per replicate: draw TWO independent block-resamples of length n,
-    compute sliced-W2 between them -> daily distance. Return (1-alpha) quantile.
+    Moving-block bootstrap of the empirical daily panel.
+    If `standardize` is True, apply column-wise z-scoring once to the pool
+    to prevent scale dominance in sliced-W2. Per replicate: draw TWO independent
+    block-resamples of fixed length n, compute sliced-W2 → daily distance.
+    Return the (1-alpha) quantile (daily).
     """
+    # pool
     R_xp = xp.asarray(R, dtype=xp.float32)
     T = int(R_xp.shape[0])
-    n = T  # resample to full length; keeps your current behavior
+    n = int(n_sample)
+
+    if standardize:
+        # NaN-safe per-asset z-scoring of the pool (leaves all-NaN cols as zeros)
+        finite = xp.isfinite(R_xp)
+        n_j = xp.maximum(finite.sum(axis=0, dtype=xp.float32), 1.0)
+        sum_j = xp.where(finite, R_xp, 0.0).sum(axis=0)
+        mu_j  = sum_j / n_j
+        Xc    = xp.where(finite, R_xp - mu_j[None, :], 0.0)
+        ss    = (Xc * Xc).sum(axis=0)
+        std_j = xp.sqrt(xp.maximum(ss / xp.maximum(n_j - 1.0, 1.0), 0.0))
+        std_j = xp.where(std_j < 1e-12, 1.0, std_j)
+        pool = xp.where(finite, Xc / std_j[None, :], 0.0)
+    else:
+        pool = R_xp
+
     rng = np.random.default_rng(seed)
     dists = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        i1 = _mbb_indices(T, n, block_len, rng=rng)
-        i2 = _mbb_indices(T, n, block_len, rng=rng)
-        X1 = R_xp[xp.asarray(i1, dtype=xp.int64)]
-        X2 = R_xp[xp.asarray(i2, dtype=xp.int64)]
-        dists[b] = sliced_w2_empirical(X1, X2, n_proj=n_proj, rng=None)
-    return float(xp.quantile(dists, 1.0 - alpha))
+        i1 = _mbb_indices(T, n, int(block_len), rng=rng)
+        i2 = _mbb_indices(T, n, int(block_len), rng=rng)
+        X1 = pool[xp.asarray(i1, dtype=xp.int64)]
+        X2 = pool[xp.asarray(i2, dtype=xp.int64)]
+        dists[b] = sliced_w2_empirical(X1, X2, n_proj=int(n_proj), rng=None)
+    return float(xp.quantile(dists, 1.0 - float(alpha)))
 
-def bootstrap_gaussian_block_delta(R, alpha=0.05, B=512, block_len=10, eps=1e-9, seed=None):
+def bootstrap_gaussian_block_delta(
+    R, alpha=0.05, B=100, block_len=10, eps=1e-9, seed=None, n_sample=252,
+    standardize=True):
     """
-    10-day moving-block bootstrap, but distance is Gelbrich W2 between the
-    Gaussian fitted to the original sample (mu0,S0) and the Gaussian fitted to
-    each block-resampled sample (mu_b,S_b). Returns daily (not annualized) delta.
+    Moving-block bootstrap; distance is Gelbrich W2 between the Gaussian fitted to
+    the reference pool (mu0,S0) and the Gaussian fitted to each block-resample.
+    Uses a fixed resample length `n_sample` via circular MBB (can wrap when n_sample > T).
+    If `standardize` is True, first z-score columns ONCE on the pool (NaN-safe), then
+    compute moments on the standardized data for both reference and resamples.
+    Returns the (1-alpha) quantile of *daily* W2 radii.
     """
-    X = xp.asarray(R, float)
-    n, d = X.shape
-    if n < 2:
+    X = xp.asarray(R, dtype=float)
+    T, d = int(X.shape[0]), int(X.shape[1])
+    if T < 2:
         return 0.0
 
-    # reference (DAILY) moments
+    # Optional: NaN-safe per-asset z-scoring on the pool (once)
+    if bool(standardize):
+        finite = xp.isfinite(X)
+        n_j = xp.maximum(finite.sum(axis=0, dtype=xp.float32), 1.0)
+        sum_j = xp.where(finite, X, 0.0).sum(axis=0)
+        mu_j  = sum_j / n_j
+        Xc    = xp.where(finite, X - mu_j[None, :], 0.0)
+        ss    = (Xc * Xc).sum(axis=0)
+        std_j = xp.sqrt(xp.maximum(ss / xp.maximum(n_j - 1.0, 1.0), 0.0))
+        std_j = xp.where(std_j < 1e-12, 1.0, std_j)
+        X = xp.where(finite, Xc / std_j[None, :], 0.0)
+
+    # Reference moments on the (possibly standardized) pool
     mu0 = xp.mean(X, axis=0)
     Xc  = X - mu0
-    S0  = (Xc.T @ Xc) / (n - 1)
+    S0  = (Xc.T @ Xc) / max(T - 1, 1)
 
+    # Fixed resample length n via circular MBB (no cap at T)
+    n = int(max(2, n_sample))
     rng = np.random.default_rng(seed)
+
     deltas = xp.empty(int(B), dtype=float)
     for b in range(int(B)):
-        idx = _mbb_indices(n, n, block_len, rng=rng)
+        idx = _mbb_indices(T, n, int(block_len), rng=rng)
         Xb  = X[xp.asarray(idx, dtype=xp.int64)]
         mub = xp.mean(Xb, axis=0)
         Xbc = Xb - mub
         Sb  = (Xbc.T @ Xbc) / max(n - 1, 1)
-        deltas[b] = wasserstein2_gaussian(mu0, S0, mub, Sb, eps)
-    return float(xp.quantile(deltas, 1.0 - alpha))
+        deltas[b] = wasserstein2_gaussian(mu0, S0, mub, Sb, float(eps))
+    return float(xp.quantile(deltas, 1.0 - float(alpha)))
+
 
 # ---------------------------------------------------------------
 # Optimization
@@ -1333,7 +1374,7 @@ def jackknife_universe_oos(
             jackknife_sec,
             CONFIG,
             verbose=False,
-            run_bootstrap=False,   # prevent recursion
+            run_jackknife=False,   # prevent recursion
             artifacts=artifacts,
         )
 
@@ -1357,6 +1398,7 @@ def jackknife_universe_oos(
 # ---------------------------------------------------------------
 
 def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
+    
     base_rows = [
         "mu_ann",
         "sigma_ann",
@@ -1364,9 +1406,10 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
         "vol_breach",
         "max_dd",
         "gross_exp",
-        "delta_mean","delta_min","delta_max",  
-        # "alpha_ann","te_ann","ir_ann","hit_rate",
+        "delta_mean","delta_min","delta_max",
+        "delta_pooled","delta_within","delta_between","delta_within_between",
     ]
+
 
     ALLOW_CI = {"mu_ann","sigma_ann","sharpe_ann","vol_breach"}
     NO_CI_MODELS = {"SPX"}
@@ -1658,6 +1701,66 @@ def compute_cov_from_window(
     Used by MVO/DRO/RegDRO (same Σ for all).
 
     Shrinkage towards scaled identity: (1-λ)Σ + λ * s2_bar * I.
+    Always returns a 2D (N,N) array, including N=1.
+    """
+    # ---- to 2D numeric array ----
+    if isinstance(R_win, pd.DataFrame):
+        X = R_win.to_numpy(np.float64, copy=False)
+    else:
+        X = np.asarray(R_win, dtype=np.float64)
+
+    if X.ndim != 2:
+        raise ValueError(f"R_win must be 2D (T,d); got shape {X.shape}")
+
+    # rows with all assets finite
+    row_ok = np.isfinite(X).all(axis=1)
+    Xc = X[row_ok, :]
+    if Xc.shape[0] < min_obs:
+        raise ValueError(
+            f"Not enough observations for covariance: {Xc.shape[0]} < {min_obs}"
+        )
+
+    # ---- sample covariance ----
+    Sig = np.cov(Xc.T, ddof=1)          # 0-D for d=1, (d,d) for d>1
+    Sig = np.asarray(Sig, dtype=np.float64)
+
+    # Force 2D
+    if Sig.ndim == 0:
+        # single asset: wrap variance
+        Sig = Sig.reshape(1, 1)
+    elif Sig.ndim != 2:
+        raise ValueError(f"Unexpected covariance ndim={Sig.ndim}")
+
+    # ---- annualize ----
+    Sig_ann = Sig * float(ann)
+
+    # ---- shrinkage ----
+    lam = float(np.clip(shrink_lambda, 0.0, 1.0))
+    if lam > 0.0:
+        N = Sig_ann.shape[0]
+        s2_bar = float(np.trace(Sig_ann) / max(N, 1))
+        Sig_ann = (1.0 - lam) * Sig_ann + lam * s2_bar * np.eye(N, dtype=np.float64)
+
+    # ---- sanity ----
+    if not np.all(np.isfinite(Sig_ann)):
+        raise ValueError("Non-finite covariance encountered.")
+    if Sig_ann.shape[0] != Sig_ann.shape[1]:
+        raise ValueError(f"Covariance must be square; got {Sig_ann.shape}")
+
+    return Sig_ann
+
+def compute_cov_from_window_OLD(
+    R_win: np.ndarray | pd.DataFrame,
+    *,
+    ann: int = 252,
+    shrink_lambda: float = 0.0,
+    min_obs: int = 2,
+) -> np.ndarray:
+    """
+    Unconditional covariance for SIMPLE returns on the full lookback window.
+    Used by MVO/DRO/RegDRO (same Σ for all).
+
+    Shrinkage towards scaled identity: (1-λ)Σ + λ * s2_bar * I.
     """
     X = R_win.to_numpy(np.float64, copy=False) if isinstance(R_win, pd.DataFrame) else np.asarray(R_win, dtype=np.float64)
     if X.ndim != 2:
@@ -1908,7 +2011,7 @@ def _tuples_in_results_csv(df_res, tuples: list[tuple[str,int,int]]) -> set[tupl
 # Pipeline
 # -------------------------
 
-def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifacts=None):
+def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifacts=None):
 
     """
     Strict version:
@@ -2291,20 +2394,130 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_bootstrap=False, artifact
     rows_reg["gross_exp"] = _gross_exp_on_window(fit_reg,    T_req)   # already aligned
 
     # Deltas: blank for MVO & SPX; aggregated for DRO & RegDRO
+    
     for k in ("delta_mean","delta_min","delta_max"):
         rows_mvo[k] = float("nan")
         rows_spx[k] = float("nan")
+    
     if len(fit_dro_pw.get("delta_list", [])):
         d = pd.Series([float(x) for x in fit_dro_pw["delta_list"] if np.isfinite(x)])
         rows_dro["delta_mean"] = float(d.mean()) if len(d) else np.nan
         rows_dro["delta_min"]  = float(d.min())  if len(d) else np.nan
         rows_dro["delta_max"]  = float(d.max())  if len(d) else np.nan
+
+    '''
+    if len(fit_reg.get("delta_list", [])):
+        d = pd.Series([float(x) for x in fit_reg["delta_list"] if np.isfinite(x)])
+        rows_reg["delta_mean"] = float(d.mean()) if len(d) else np.nan
+        rows_reg["delta_min"]  = float(d.min())  if len(d) else np.nan
+        rows_reg["delta_max"]  = float(d.max())  if len(d) else np.nan
+    '''
+
+    # BEG OF NEW
+
     if len(fit_reg.get("delta_list", [])):
         d = pd.Series([float(x) for x in fit_reg["delta_list"] if np.isfinite(x)])
         rows_reg["delta_mean"] = float(d.mean()) if len(d) else np.nan
         rows_reg["delta_min"]  = float(d.min())  if len(d) else np.nan
         rows_reg["delta_max"]  = float(d.max())  if len(d) else np.nan
 
+    # --- NEW: delta decomposition diagnostics shown in OOS summary ---
+
+    # initialize to NaN for all four strategies
+    for rows in (rows_mvo, rows_spx, rows_dro, rows_reg):
+        rows["delta_pooled"] = float("nan")
+        rows["delta_within"] = float("nan")
+        rows["delta_between"] = float("nan")
+        rows["delta_within_between"] = float("nan")
+
+    lam    = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
+    min_lb = int(CONFIG["REBAL"]["min_lookback_days"])
+
+    # Helper: pooled delta on a panel R_df with the same delta config
+    def _pooled_delta(R_df, params_delta):
+        mask_all = np.ones(R_df.shape[0], dtype=bool)
+        mu_full  = compute_mean_from_window(R_df, mask_all, min_obs=min_lb, ann=AF)
+        Sig_full = compute_cov_from_window(R_df, ann=AF, shrink_lambda=lam, min_obs=min_lb)
+        return compute_delta(params_delta.get("kappa", 1.0),
+                             mu_full, Sig_full,
+                             R=R_df.to_numpy(float),
+                             params=params_delta)
+
+    # 2.1 DRO: δ_pooled on the unconditional OOS panel (matching the DRO asset set)
+    try:
+        rows_dro["delta_pooled"] = float(_pooled_delta(R_oos, params_dro))
+    except Exception:
+        rows_dro["delta_pooled"] = float("nan")
+
+    # 2.2 RegDRO: δ_pooled, δ_within, δ_between (on the RegDRO asset set)
+    try:
+        # use the RegDRO panel and segments already defined above
+        R_reg_df = R_reg  # (OOS window, names_all)
+        params_reg_local = dict(params_reg)
+
+        # δ_pooled (same method as DRO but on the RegDRO asset set)
+        rows_reg["delta_pooled"] = float(_pooled_delta(R_reg_df, params_reg_local))
+
+        # weights π_k by OOS segment length
+        seg_lengths = np.diff(np.array(taus, dtype=int))
+        total_len   = float(seg_lengths.sum())
+        if total_len <= 0:
+            raise RuntimeError("Empty regime segmentation on OOS window.")
+        pi = seg_lengths / total_len
+
+        # Decide which ground W₂ to use for 'between'
+        method = str(params_reg_local.get("delta_method", "bootstrap_np")).lower()
+        use_gaussian = ("gaussian" in method)
+        n_proj = int(params_reg_local.get("n_proj", 128))
+
+        # δ_within: per-segment bootstrap δ_k then combine in quadrature
+        delta_k = []
+        for (a_, b_) in zip(taus[:-1], taus[1:]):
+            Xk_df = R_reg_df.iloc[a_:b_, :]
+            # guard short segments: allowed because compute_delta uses MBB
+            mu_k  = compute_mean_from_window(Xk_df, np.ones(len(Xk_df), dtype=bool),
+                                             min_obs=min_lb, ann=AF)
+            Sig_k = compute_cov_from_window(Xk_df, ann=AF, shrink_lambda=lam, min_obs=min_lb)
+            dk    = compute_delta(params_reg_local.get("kappa", 1.0),
+                                  mu_k, Sig_k,
+                                  R=Xk_df.to_numpy(float),
+                                  params=params_reg_local)
+            delta_k.append(float(dk))
+        rows_reg["delta_within"] = float(np.sqrt(np.sum(pi * (np.asarray(delta_k)**2))))
+
+        # δ_between: pairwise W₂ between segment empirical distributions
+        # (same distance family as above; scale to match δ units by AF)
+        def _pairwise_w2(i, j):
+            Xi = R_reg_df.iloc[taus[i]:taus[i+1], :].to_numpy(float)
+            Xj = R_reg_df.iloc[taus[j]:taus[j+1], :].to_numpy(float)
+            if use_gaussian:
+                mui = np.mean(Xi, axis=0);    Si = np.cov(Xi.T, ddof=1)
+                muj = np.mean(Xj, axis=0);    Sj = np.cov(Xj.T, ddof=1)
+                dij = wasserstein2_gaussian(mui, Si, muj, Sj)
+            else:
+                dij = sliced_w2_empirical(Xi, Xj, n_proj=n_proj, rng=None)
+            # match the scale used by compute_delta (bootstrap_* returns AF * daily-distance)
+            return float(AF * dij)
+
+        D2 = 0.0
+        K  = len(taus) - 1
+        for i in range(K):
+            for j in range(i+1, K):
+                dij = _pairwise_w2(i, j)
+                D2 += 2.0 * float(pi[i]) * float(pi[j]) * (dij ** 2)
+        rows_reg["delta_between"] = float(np.sqrt(max(D2, 0.0)))
+
+        # Composite check
+        w_ = rows_reg["delta_within"]; b_ = rows_reg["delta_between"]
+        rows_reg["delta_within_between"] = float(np.sqrt((w_*w_) + (b_*b_)))
+    except Exception:
+        # leave NaNs if anything fails; table still renders
+        pass
+
+    # Bench-relative point estimates (only for strategy columns)
+
+
+    # END OF NEW 
     # Bench-relative point estimates (only for strategy columns)
     def _bench_stats(port, bench, AF=252):
         ex = (port - bench).dropna()
