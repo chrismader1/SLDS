@@ -14,13 +14,11 @@ except Exception:
 print(f"GPU={GPU}")
 
 # Others
-import hashlib
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import cvxpy as cp
-import os, re, ast
-import io, gzip, pickle
+import os
+import gzip, pickle
 from scipy import stats as sp_stats
 from datetime import datetime
 
@@ -152,53 +150,55 @@ def wasserstein2_gaussian(mu1, Sigma1, mu2, Sigma2, eps=1e-12):
     w2_sq = max(dmu2 + trpart, 0.0)
     return float(xp.sqrt(w2_sq))
 
-def sliced_w2_empirical(X, Y, n_proj=256, rng=None):
+def sliced_w2_empirical(X, Y, n_proj=256, rng=None, U=None):
     """
     1D sliced W2 between empirical measures using random projections.
-    Unequal sample sizes use mid-quantiles q_i = (i-0.5)/k
-    Avoids sorting when taking quantiles path (m != n)
+    If U is provided (shape = [n_proj, d], row-unit vectors), it is used and
+    n_proj/rng are ignored. This lets us reuse the same directions across
+    bootstrap, within, and between computations to avoid duplication/drift.
     """
     X = xp.asarray(X, dtype=xp.float32)
     Y = xp.asarray(Y, dtype=xp.float32)
     n, d = X.shape
     m = Y.shape[0]
 
-    # Generate directions on device when possible
-    if (rng is None) and hasattr(xp.random, "standard_normal"):
-        try:
-            U = xp.random.standard_normal((n_proj, d), dtype=X.dtype)  # CuPy fast path
-        except TypeError:
-            U = xp.random.standard_normal((n_proj, d)).astype(X.dtype, copy=False)  # NumPy fallback
+    if U is None:
+        # Generate directions on device when possible
+        if (rng is None) and hasattr(xp.random, "standard_normal"):
+            try:
+                U = xp.random.standard_normal((int(n_proj), d), dtype=X.dtype)
+            except TypeError:
+                U = xp.random.standard_normal((int(n_proj), d)).astype(X.dtype, copy=False)
+        else:
+            rng = _rng_from_params({}) if rng is None else rng
+            U = xp.asarray(rng.normal(size=(int(n_proj), d)), dtype=X.dtype)
+        U = U / xp.maximum(xp.linalg.norm(U, axis=1, keepdims=True), 1e-12)
     else:
-        rng = _rng_from_params({}) if rng is None else rng
-        U = xp.asarray(rng.normal(size=(n_proj, d)), dtype=X.dtype)
-
-    U = U / xp.maximum(xp.linalg.norm(U, axis=1, keepdims=True), 1e-12)
+        U = xp.asarray(U, dtype=X.dtype)
+        # assume caller already normalized U
 
     XU = X @ U.T
     YU = Y @ U.T
 
     if m == n:
-        # Equal sizes → sort and match order statistics
         XU = xp.sort(XU, axis=0)
         YU = xp.sort(YU, axis=0)
         diff = XU - YU
         w2_sq = xp.mean(diff * diff)
         return float(xp.sqrt(xp.maximum(w2_sq, 0.0)))
     else:
-        # Unequal sizes → mid-quantiles without prior sort
         k = int(min(n, m))
         if k <= 1:
             XU = xp.mean(XU, axis=0, keepdims=True)
             YU = xp.mean(YU, axis=0, keepdims=True)
         else:
-            q = (xp.arange(1, k + 1, dtype=XU.dtype) - 0.5) / k  # mid-quantiles
+            q = (xp.arange(1, k + 1, dtype=XU.dtype) - 0.5) / k
             XU = xp.quantile(XU, q, axis=0)
             YU = xp.quantile(YU, q, axis=0)
         diff = XU - YU
         w2_sq = xp.mean(diff * diff)
         return float(xp.sqrt(xp.maximum(w2_sq, 0.0)))
-        
+
 def _mbb_indices(T: int, m: int, L: int, rng=None) -> np.ndarray:
     """
     Moving-block bootstrap: draw start positions U(0..T-1), take L-length
@@ -217,8 +217,8 @@ def _mbb_indices(T: int, m: int, L: int, rng=None) -> np.ndarray:
     return idx
 
 def bootstrap_np_block_delta(
-    R, n_proj=128, B=100, block_len=21, alpha=0.05, seed=None, n_sample=252,
-    standardize=True):
+    R, n_proj=512, B=100, block_len=55, alpha=0.05, seed=None, n_sample=512,
+    standardize=False, U=None):
     """
     Moving-block bootstrap of the empirical daily panel.
     If `standardize` is True, apply column-wise z-scoring once to the pool
@@ -231,6 +231,9 @@ def bootstrap_np_block_delta(
     T = int(R_xp.shape[0])
     n = int(n_sample)
 
+    # scale factor to bring standardized distances back to original units
+    scale = 1.0
+
     if standardize:
         # NaN-safe per-asset z-scoring of the pool (leaves all-NaN cols as zeros)
         finite = xp.isfinite(R_xp)
@@ -241,6 +244,10 @@ def bootstrap_np_block_delta(
         ss    = (Xc * Xc).sum(axis=0)
         std_j = xp.sqrt(xp.maximum(ss / xp.maximum(n_j - 1.0, 1.0), 0.0))
         std_j = xp.where(std_j < 1e-12, 1.0, std_j)
+
+        # RMS daily std across assets ≈ sqrt(tr(Sigma)/d)
+        scale = float(xp.sqrt(xp.mean(std_j * std_j)))
+
         pool = xp.where(finite, Xc / std_j[None, :], 0.0)
     else:
         pool = R_xp
@@ -252,12 +259,15 @@ def bootstrap_np_block_delta(
         i2 = _mbb_indices(T, n, int(block_len), rng=rng)
         X1 = pool[xp.asarray(i1, dtype=xp.int64)]
         X2 = pool[xp.asarray(i2, dtype=xp.int64)]
-        dists[b] = sliced_w2_empirical(X1, X2, n_proj=int(n_proj), rng=None)
-    return float(xp.quantile(dists, 1.0 - float(alpha)))
+        dists[b] = sliced_w2_empirical(X1, X2, n_proj=int(n_proj), rng=None, U=U)
+
+    # If standardized, dists are in “z-score” units; rescale by typical daily σ
+    return float(scale * xp.quantile(dists, 1.0 - float(alpha)))
+
 
 def bootstrap_gaussian_block_delta(
-    R, alpha=0.05, B=100, block_len=10, eps=1e-9, seed=None, n_sample=252,
-    standardize=True):
+    R, alpha=0.05, B=100, block_len=55, eps=1e-9, seed=None, n_sample=512,
+    standardize=False):
     """
     Moving-block bootstrap; distance is Gelbrich W2 between the Gaussian fitted to
     the reference pool (mu0,S0) and the Gaussian fitted to each block-resample.
@@ -271,6 +281,9 @@ def bootstrap_gaussian_block_delta(
     if T < 2:
         return 0.0
 
+    # Scale factor to move standardized distances back to original units
+    scale = 1.0
+
     # Optional: NaN-safe per-asset z-scoring on the pool (once)
     if bool(standardize):
         finite = xp.isfinite(X)
@@ -281,6 +294,10 @@ def bootstrap_gaussian_block_delta(
         ss    = (Xc * Xc).sum(axis=0)
         std_j = xp.sqrt(xp.maximum(ss / xp.maximum(n_j - 1.0, 1.0), 0.0))
         std_j = xp.where(std_j < 1e-12, 1.0, std_j)
+
+        # RMS daily std across assets
+        scale = float(xp.sqrt(xp.mean(std_j * std_j)))
+
         X = xp.where(finite, Xc / std_j[None, :], 0.0)
 
     # Reference moments on the (possibly standardized) pool
@@ -300,7 +317,9 @@ def bootstrap_gaussian_block_delta(
         Xbc = Xb - mub
         Sb  = (Xbc.T @ Xbc) / max(n - 1, 1)
         deltas[b] = wasserstein2_gaussian(mu0, S0, mub, Sb, float(eps))
-    return float(xp.quantile(deltas, 1.0 - float(alpha)))
+
+    # If standardized, Gaussian W2 is in z-units; rescale by typical daily σ
+    return float(scale * xp.quantile(deltas, 1.0 - float(alpha)))
 
 
 # ---------------------------------------------------------------
@@ -334,10 +353,12 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
 
     # ----- κ-based rules
     if method == "kappa_rate":
+        if Sigma is None:
+            raise ValueError("kappa_rate requires Sigma.")
         d     = int(xp.size(mu_est))
         n_obs = int(R.shape[0]) if (R is not None and hasattr(R, "shape")) else 1
         n_eff = int((params or {}).get("n_ref", n_obs))
-        sbar  = float(xp.sqrt(xp.trace(Sigma) / max(d, 1))) if Sigma is not None else 0.0
+        sbar  = float(xp.sqrt(xp.trace(Sigma) / max(d, 1)))
         return kappa * sbar * xp.sqrt(d / max(n_eff, 1))
 
     if method == "fixed":
@@ -372,7 +393,7 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         standardize = bool((params or {}).get("standardize", True))
         delta_daily = bootstrap_np_block_delta(
             R, n_proj=n_proj, B=B, block_len=L, alpha=alpha, seed=seed,
-            n_sample=n_sample, standardize=standardize,)
+            n_sample=n_sample, standardize=standardize, U=params.get("U", None))
         return float(np.sqrt(AF)) * float(delta_daily)
     
     if method == "bootstrap_gaussian":
@@ -387,7 +408,7 @@ def compute_delta(kappa, mu_est, Sigma=None, R=None, params=None):
         delta_daily = bootstrap_gaussian_block_delta(
             R, alpha=alpha, B=B, block_len=L, eps=eps, seed=seed,
             n_sample=n_sample, standardize=standardize,)    
-    return float(np.sqrt(AF)) * float(delta_daily)
+        return float(np.sqrt(AF)) * float(delta_daily)
 
     raise ValueError(f"Unknown delta_method='{method}'")
 
@@ -437,75 +458,6 @@ def psd_factor_LtL(Sigma, eps):
 
     # L so that L^T L ≈ Σ
     return _np.ascontiguousarray(C.T, dtype=_np.float64)
-
-def _sigma_unconditional(
-    R_df: pd.DataFrame,
-    t_idx: int,
-    ann: int = 252,
-    min_obs: int = 21,
-    max_lookback: int = 1260,
-    shrink_lambda: float = 0.0,
-):
-    """
-    Unconditional (no regime conditioning) sample covariance from a rolling window
-    [t0, t_idx], using log-returns and pairwise NaN-safe estimator, then annualized
-    and shrunk toward scaled identity:
-        Σ_shrunk = (1-λ) Σ + λ * (tr(Σ)/N) I,  λ in [0,1].
-    Returns (Sigma_ann[N,N], ok: bool, counts: dict[col]->int).
-    """
-    import numpy as _np
-    R_df = pd.DataFrame(R_df)
-    T = len(R_df.index)
-    t_idx = int(min(max(0, t_idx), T - 1))
-    t0 = int(max(0, t_idx - int(max_lookback) + 1))
-
-    X = R_df.to_numpy(_np.float64, copy=False)      # (T,N) possibly with NaNs
-    L = xp.log1p(xp.asarray(X))                     # log-returns
-    M = ~xp.isnan(L)                                # availability mask (T,N)
-
-    # restrict window
-    win = xp.zeros(T, dtype=bool); win[t0:t_idx+1] = True
-    W = M & win[:, None]                            # rows used per asset
-
-    N = L.shape[1]
-    counts = {}
-    for j, name in enumerate(R_df.columns):
-        counts[str(name)] = int(W[:, j].sum())
-
-    # require at least min_obs per asset
-    if any(c < int(min_obs) for c in counts.values()):
-        return xp.zeros((N, N)), False, counts
-
-    # pairwise NaN-safe covariance on window
-    n_i = W.sum(axis=0).astype(L.dtype)             # (N,)
-    sums = (W * L).sum(axis=0)                      # (N,)
-    means = xp.where(n_i > 0, sums / n_i, 0.0)
-    Xc = xp.where(W, L - means[None, :], 0.0)
-
-    N_ij = (W.astype(L.dtype)).T @ W.astype(L.dtype)
-    S_ij = Xc.T @ Xc
-
-    with xp.errstate(invalid="ignore", divide="ignore"):
-        C_ij = xp.where(N_ij >= 2.0, S_ij / (N_ij - 1.0), 0.0)
-
-    # set diagonal from unbiased per-asset sample variances
-    for j in range(N):
-        nj = int(n_i[j])
-        if nj >= 2:
-            xj = Xc[:, j][W[:, j]]
-            C_ij[j, j] = float((xj @ xj) / (nj - 1))
-        else:
-            C_ij[j, j] = 0.0
-
-    Sigma_ann = ann * C_ij
-
-    # shrinkage toward scaled identity
-    lam = float(max(0.0, min(1.0, shrink_lambda)))
-    if lam > 0.0:
-        s2_bar = float(xp.trace(Sigma_ann) / max(N, 1))
-        Sigma_ann = (1.0 - lam) * Sigma_ann + lam * s2_bar * xp.eye(N)
-
-    return Sigma_ann, True, counts
 
 def solve_optimizer(mu, Sigma, delta, config, verbose=False):
     
@@ -734,6 +686,17 @@ def print_single_portfolio_block(label, w, returns_train, returns_eval, rho, Sig
     nz = xp.where(wxp != 0)[0]
     bot_idx = nz[xp.argsort(wxp[nz])[:3]] if nz.size else xp.array([], dtype=int)
 
+    return {
+        "ret_train_ann": ret_train_ann,
+        "risk_train_ann": risk_train_ann,
+        "ok_train": ok_train,
+        "ret_eval_ann": ret_eval_ann,
+        "risk_eval_ann": risk_eval_ann,
+        "gross_exposure": gross_exposure,
+        "top_idx": asnumpy_strict(top_idx).tolist(),
+        "bot_idx": asnumpy_strict(bot_idx).tolist(),
+    }
+
 def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
                        taus_display, seg_deltas, config=None):
     """
@@ -766,6 +729,17 @@ def print_regime_block(label, returns_train, returns_eval, w_list, segs, rho,
     # Asset-level sample stats (arith. daily → annualized)
     mu_train_ann_assets    = AF * xp.mean(Rtr, axis=0)
     sigma_train_ann_assets = xp.sqrt(AF) * xp.std(Rtr, axis=0, ddof=1)
+
+    return {
+        "ret_train_ann": float(ret_train_ann),
+        "risk_train_ann": float(risk_train_ann),
+        "ret_eval_ann": float(ret_eval_ann),
+        "risk_eval_ann": float(risk_eval_ann),
+        "mu_train_ann_assets": asnumpy_strict(mu_train_ann_assets).tolist(),
+        "sigma_train_ann_assets": asnumpy_strict(sigma_train_ann_assets).tolist(),
+        "taus_display": list(taus_display),
+        "seg_deltas": list(seg_deltas),
+    }
 
 def fit_mvo(data, params, G):
     """
@@ -826,26 +800,28 @@ def fit_regime_dro(data, params, G):
             log_seg = xp.log1p(R_seg)
             mu_est  = xp.expm1(log_seg.mean(axis=0) * AF)
 
-        # unconditional Σ from rolling window ending at b-1 over the current asset set (full panel here)
+        # unconditional Σ from rolling window [ws, t_for_sigma] on SIMPLE returns, shrunk
         min_obs = int(params.get("min_lookback_days", 21))
         max_lb  = int(params.get("max_lookback_days", 1260))
         lam_shr = float(params.get("sigma_shrinkage_lambda", 0.0))
         
-        # Build a DataFrame for the helper (columns optional but helpful for counts)
         import numpy as _np
         R_df_full = pd.DataFrame(_np.asarray(data["train"], dtype=float),
                                  columns=list(data.get("px_cols", range(data["train"].shape[1]))))
         
         t_for_sigma = max(0, min(int(b) - 1, int(data["n_days"]) - 1))
-        Sigma_est, ok_sig, _ = _sigma_unconditional(
-            R_df_full, t_idx=t_for_sigma, ann=AF,
-            min_obs=min_obs, max_lookback=max_lb, shrink_lambda=lam_shr,
-        )
-        if not ok_sig:
+        ws = _window_start(t_for_sigma + 1, min_obs, max_lb)  # end-exclusive; +1 to include t_for_sigma
+        R_win_df = R_df_full.iloc[ws : t_for_sigma + 1]
+        
+        try:
+            Sigma_est = xp.asarray(
+                compute_cov_from_window(R_win_df, ann=AF, shrink_lambda=lam_shr, min_obs=min_obs),
+                dtype=float
+            )
+        except Exception:
             Sigma_est = xp.asarray(data["Sigma_ann_full"], float)
-        else:
-            Sigma_est = xp.asarray(Sigma_est, float)
 
+        
         R_source  = R_seg
     
         # pass full-sample N via n_ref but bootstrap from R_source
@@ -860,7 +836,8 @@ def fit_regime_dro(data, params, G):
                 d = dt[t_fit]
                 dt_str = f"{getattr(d, 'date', lambda: d)()}"
             print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta={float(delta_k):.4f}")
-            _print_mu_by_name(keep if 'keep' in locals() else list(data.get('px_cols', [])), mu_est)
+            names = list(data.get("px_cols", range(len(mu_est))))
+            _print_mu_by_name(names, mu_est)
         w_k = solve_optimizer(mu_est, Sigma_est, delta_k, G, verbose=bool(params.get("verbose", False)))        
         deltas.append(float(delta_k)); w_list.append(w_k)
         
@@ -899,9 +876,11 @@ def fit_regime_dro_rev_constSigma(data, params, G):
 # ---------------------------------------------------------------
 
 def evaluate_portfolio(fit, data, G):
+    
     train, test = data["train"], data["test"]; 
     n_days = data["n_days"]
     AF = int(data.get("ann_factor", 252))
+    
     if fit["type"] == "static":
         stats_oos = portfolio_stats(
             fit["w"], test, {"n_days": n_days, "risk_free_rate": G["risk_free_rate"],
@@ -923,12 +902,16 @@ def evaluate_portfolio(fit, data, G):
         stats_oos["sigma_train_ann"] = float(sigma_train_ann)
         stats_oos["sigma_oos_ann"] = float(stats_oos["sigma_ann"])
         stats_oos["train_soc_risk"] = train_soc
-        stats_oos["train_constraint_slack"] = float(G["risk_budget"] - train_soc) if xp.isfinite(train_soc) else xp.nan
+        stats_oos["train_constraint_slack"] = float(G["risk_budget"] - train_soc) if xp.isfinite(train_soc) else xp.nan                
         stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
+        # new delta schema for static fits: only 'delta' populated
         stats_oos["delta"] = float(fit.get("delta", xp.nan))
+        stats_oos["delta_uncond"] = xp.nan
+        stats_oos["delta_gap"] = xp.nan
         rebal = [0, n_days]
         stats_oos["avg_holding_per"] = _avg_holding_period_from_marks(rebal)
         return stats_oos
+
     
     else:  # piecewise
         cfg = {"n_days": n_days, "risk_free_rate": G["risk_free_rate"], "risk_budget": G["risk_budget"], "annualization_factor": AF}
@@ -951,17 +934,16 @@ def evaluate_portfolio(fit, data, G):
         stats_oos["train_constraint_slack"] = xp.nan
         stats_oos["kappa"] = float(fit.get("kappa", xp.nan))
 
-        # Aggregate per-segment deltas
+        # New delta schema for piecewise fits:
+        # 'delta' = average of optimisation deltas; no unconditional counterfactual here.
         dlist = xp.asarray(fit.get("delta_list", []), dtype=float)
         if dlist.size:
-            stats_oos["delta_mean"] = float(xp.nanmean(dlist))
-            stats_oos["delta_min"]  = float(xp.nanmin(dlist))
-            stats_oos["delta_max"]  = float(xp.nanmax(dlist))
+            mask = xp.isfinite(dlist)
+            stats_oos["delta"] = float(xp.mean(dlist[mask])) if int(mask.sum()) else xp.nan
         else:
-            stats_oos["delta_mean"] = xp.nan
-            stats_oos["delta_min"]  = xp.nan
-            stats_oos["delta_max"]  = xp.nan
-        stats_oos["delta"] = xp.nan  # keep legacy key empty for Regime-DRO
+            stats_oos["delta"] = xp.nan
+        stats_oos["delta_uncond"] = xp.nan
+        stats_oos["delta_gap"] = xp.nan
                 
         rebal = list(fit.get("segs", []))
         if not rebal:
@@ -1358,8 +1340,9 @@ def jackknife_universe_oos(
     METRICS = [
         "mu_ann","sigma_ann","sharpe_ann","vol_breach","max_dd",
         "alpha_ann","te_ann","ir_ann","hit_rate","gross_exp",
-        "delta_mean","delta_min","delta_max",
+        "delta","delta_uncond","delta_gap",
     ]
+
     buckets = {s: {k: [] for k in METRICS} for s in ("MVO", "DRO", "RegDRO")}
 
     for b in range(n_blocks):
@@ -1414,12 +1397,21 @@ def oos_summary(results: dict, model_order=None) -> pd.DataFrame:
         "vol_breach",
         "max_dd",
         "gross_exp",
-        "delta_mean","delta_min","delta_max",
-        "delta_pooled","delta_within","delta_between","delta_within_between",
+        "delta",
+        "delta_uncond",
+        "delta_gap",
     ]
 
-
-    ALLOW_CI = {"mu_ann","sigma_ann","sharpe_ann","vol_breach"}
+    ALLOW_CI = {
+        "mu_ann",
+        "sigma_ann",
+        "sharpe_ann",
+        "vol_breach",
+        "delta",
+        "delta_uncond",
+        "delta_gap",
+    }
+    
     NO_CI_MODELS = {"SPX"}
 
     if model_order is None:
@@ -1757,40 +1749,89 @@ def compute_cov_from_window(
 
     return Sig_ann
 
-def compute_cov_from_window_OLD(
-    R_win: np.ndarray | pd.DataFrame,
+def regdro_decision_context(
     *,
-    ann: int = 252,
-    shrink_lambda: float = 0.0,
-    min_obs: int = 2,
-) -> np.ndarray:
+    D_pos: int,
+    full_index_fit: pd.DatetimeIndex,
+    df_returns_full: pd.DataFrame,
+    names_all: list[str],
+    Z_labels_fit: dict[str, np.ndarray],
+    AF: int,
+    min_obs: int,
+    max_lb: int,
+    lam_shr: float,
+    G: dict,
+):
     """
-    Unconditional covariance for SIMPLE returns on the full lookback window.
-    Used by MVO/DRO/RegDRO (same Σ for all).
-
-    Shrinkage towards scaled identity: (1-λ)Σ + λ * s2_bar * I.
+    Build the optimisation context at a *single* decision date (position on FIT index).
+    Returns:
+        ok: bool
+        keep: list[str]
+        pos_map: dict[str,int]
+        X_win_df: pd.DataFrame
+        mu_cond: np.ndarray
+        mu_uncond: np.ndarray
+        Sig: np.ndarray
+        X_win: np.ndarray                    # numpy window matrix for bootstrap δ
+        mask_cond_all: np.ndarray[bool]      # row mask used to compute δ on conditional data
     """
-    X = R_win.to_numpy(np.float64, copy=False) if isinstance(R_win, pd.DataFrame) else np.asarray(R_win, dtype=np.float64)
-    if X.ndim != 2:
-        raise ValueError("R_win must be 2D (T,d).")
-    # Keep only rows where all assets are finite to ensure a consistent time index for Σ
-    row_ok = np.isfinite(X).all(axis=1)
-    Xc = X[row_ok, :]
-    if Xc.shape[0] < min_obs:
-        raise ValueError(f"Not enough observations for covariance: {Xc.shape[0]} < {min_obs}")
+    # Window on FIT calendar: [a_win, D_pos)
+    a_win = max(0, int(D_pos) - int(max_lb))
+    b_win = int(D_pos)
+    if b_win - a_win < max(2, int(min_obs)):
+        return False, [], {}, pd.DataFrame(), np.array([]), np.array([]), np.zeros((0, 0)), np.zeros((0, 0)), np.zeros(0, dtype=bool)
 
-    Sig = np.cov(Xc.T, ddof=1)                     # simple returns cov
-    Sig_ann = Sig * float(ann)
+    win_idx = full_index_fit.take(np.arange(a_win, b_win, dtype=int))
 
-    lam = float(np.clip(shrink_lambda, 0.0, 1.0))
-    if lam > 0.0:
-        N = Sig_ann.shape[0]
-        s2_bar = float(np.trace(Sig_ann) / max(N, 1))
-        Sig_ann = (1.0 - lam) * Sig_ann + lam * s2_bar * np.eye(N, dtype=np.float64)
+    keep, masks = [], []
+    for n in names_all:
+        z_ser = np.asarray(Z_labels_fit[n], dtype=float)
+        z_now = z_ser[D_pos] if (0 <= D_pos < len(z_ser)) else np.nan
+        if not np.isfinite(z_now):
+            continue
+        # same-regime mask inside the lookback window
+        m = (z_ser[a_win:b_win] == z_now)
+        if not np.any(m):
+            continue
+        x = df_returns_full.loc[win_idx, n].to_numpy(float)
+        m = m & np.isfinite(x)
+        if int(m.sum()) >= int(min_obs):
+            keep.append(n)
+            masks.append(m)
+            
+    if not keep:
+        return False, [], {}, pd.DataFrame(), np.array([]), np.array([]), np.zeros((0, 0)), np.zeros((0, 0)), np.zeros(0, dtype=bool)
 
-    if not np.all(np.isfinite(Sig_ann)):
-        raise ValueError("Non-finite covariance encountered.")
-    return Sig_ann
+    # Optional cap-feasibility
+    cap_applies = bool(G.get("no_shorting", False)) and np.isfinite(G.get("max_pos_size", np.nan)) and (G.get("max_pos_size", 0.0) > 0.0)
+
+    if cap_applies:
+        c_max = float(G.get("max_cash", 0.0))
+        u     = float(G.get("max_pos_size", 1.0))
+        N_req = int(np.ceil((1.0 - c_max) / max(u, 1e-12)))
+        if len(keep) < N_req:
+            return False, [], {}, pd.DataFrame(), np.array([]), np.array([]), np.zeros((0, 0)), np.zeros((0, 0)), np.zeros(0, dtype=bool)
+
+    # Assemble window DF and moments
+    X_win_df = df_returns_full.loc[win_idx, keep]
+    # conditional μ (per-asset, masked)
+    mu_cond = np.asarray(
+        [compute_mean_from_window(X_win_df[[n]], masks[j], min_obs=min_obs, ann=AF)[0]
+         for j, n in enumerate(keep)],
+        dtype=float
+    )
+    # unconditional Σ and μ on the same window and asset set
+    Sig = compute_cov_from_window(X_win_df[keep], ann=AF, shrink_lambda=lam_shr, min_obs=min_obs)
+
+    mask_all = np.ones(X_win_df.shape[0], dtype=bool)
+    mu_uncond = compute_mean_from_window(X_win_df, mask_all, min_obs=min_obs, ann=AF)
+
+    # intersection mask: rows that are “in-regime & finite” for all kept assets
+    mask_cond_all = np.logical_and.reduce(masks) if len(masks) else np.zeros(X_win_df.shape[0], dtype=bool)
+
+    X_win = X_win_df.to_numpy(float)
+    pos_map = {n: i for i, n in enumerate(names_all)}
+    return True, keep, pos_map, X_win_df, mu_cond, mu_uncond, Sig, X_win, mask_cond_all
 
 def _make_solver_cfg_from_CONFIG(CONFIG):
     P = CONFIG["PORTFOLIO"]
@@ -1814,16 +1855,23 @@ def _make_solver_cfg_from_CONFIG(CONFIG):
 def _gross_exp_on_window(fit, T_req, win=None):
     """Average gross exposure over a reporting window of length T_req (optionally [a,b) slice)."""
     import numpy as _np
+    def _ge_vec(w):
+        # Force any xp (CuPy/NumPy) vector to a pure NumPy array first
+        w_np = asnumpy_strict(w, dtype=float).ravel()
+        return float(_np.sum(_np.abs(w_np)))
+
     if fit["type"] == "static":
-        return float(_np.sum(_np.abs(fit["w"])))
+        return _ge_vec(fit["w"])
+
     segs = [int(x) for x in fit["segs"]]
     a0, b0 = (0, 10**12) if win is None else (int(win[0]), int(win[1]))
     num = 0.0
     for (a, b), w in zip(zip(segs[:-1], segs[1:]), fit["w_list"]):
         L = max(0, min(b, b0) - max(a, a0))
         if L > 0:
-            num += L * float(_np.sum(_np.abs(w)))
+            num += L * _ge_vec(w)
     return num / max(T_req, 1)
+
     
 def make_index_rebal(
     intersection_index: pd.DatetimeIndex,
@@ -2019,7 +2067,8 @@ def _tuples_in_results_csv(df_res, tuples: list[tuple[str,int,int]]) -> set[tupl
 # Pipeline
 # -------------------------
 
-def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifacts=None):
+def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifacts=None,
+                 models=["MVO_fixed", "DRO_fixed", "RegDRO"]):
 
     """
     Strict version:
@@ -2029,7 +2078,31 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
       • _select_best_config/_expand_weights preserved elsewhere in file
       • δ aggregates included for DRO and RegDRO
       • SPX included in OOS summary table
+
+    Parameters
+    ----------
+    securities : list[str] or None
+        Universe of securities.
+    CONFIG : dict
+        Global configuration.
+    models : list[str] or None
+        Which optimisation models to expose in outputs and tables.
+        Valid values:
+            "MVO_fixed", "DRO_fixed", "MVO_event", "DRO_event", "RegDRO".
+        If None, all are used.
     """
+
+    # --- model selection -------------------------------------------------
+    ALL_MODELS = ("MVO_fixed", "DRO_fixed", "MVO_event", "DRO_event", "RegDRO")
+    if models is None:
+        models = list(ALL_MODELS)
+    else:
+        models = [str(m) for m in models]
+        invalid = [m for m in models if m not in ALL_MODELS]
+        if invalid:
+            raise ValueError(f"Unknown models: {invalid}. Valid models: {ALL_MODELS}")
+    models_set = set(models)
+    # ---------------------------------------------------------------------
 
     # detect bootstrap context (set by bootstrap_universe_oos)
     _boot = CONFIG.get("__bootstrap_run", {})
@@ -2104,81 +2177,27 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
     else:
         spx_daily = pd.Series(index=full_index, dtype=float, name="SPX_daily")
 
-    # ===== MVO & DRO (rebalanced on intersection == full_index) =====
-    k_days = int(CONFIG["REBAL"]["rebalance_period_days"])
-    if k_days <= 0: raise ValueError("rebalance_period_days must be > 0.")
-    # marks on the FIT index (history included)
-    index_rebal, marks = make_index_rebal(full_index_fit, s, e, k_days)
-
+    # ===== UNIFIED DECISION-DAY ENGINE (RegDRO + MVO/DRO event-based + MVO/DRO fixed-with-RegDRO-universe) =====    
     lam    = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
     min_lb = int(CONFIG["REBAL"]["min_lookback_days"])
     max_lb = int(CONFIG["REBAL"]["max_lookback_days"])
     AF     = int(CONFIG.get("annualization_factor", 252))
-
-    R_use = df_returns_full.copy()  # extended history for fitting
-
-    # MVO (piecewise)
-    fit_mvo = fit_mvo_rebalanced(R_use, G, AF, marks,
-                                 min_lb=min_lb, max_lb=max_lb, lam_shr=lam,
-                                 verbose=bool(verbose))
-
-    # --- MVO: build weights-on-dates from piecewise fit, then apply unified PnL helper ---
-    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
-    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
-
-    # keep only rebal dates >= start_dt so PnL respects the cash cap from day 1 of OOS
-    rebal_dates_fit = full_index_fit[marks[:-1]]
-    oos_start = oos_index[0]
-
-    mvo_rows = []
-    for dt, w in zip(rebal_dates_fit, fit_mvo["w_list"]):
-        if dt >= oos_start:
-            mvo_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=R_use.columns, name=dt))
-    W_rebal_mvo = pd.DataFrame(mvo_rows).sort_index()
-        
-    mvo_daily, W_daily_mvo, W_eff_mvo = pnl_with_delay_and_cost(
-        W_on_dates=W_rebal_mvo,
-        full_index=full_index, R_df=R_oos,
-        delay=k_delay, tc=tc, name="MVO_daily",)
-
-    # DRO (piecewise)
-    params_dro = dict(CONFIG["DELTA_DEFAULTS"][CONFIG["PORTFOLIO"]["delta_name"]])
-    fit_dro_pw = fit_dro_rebalanced(R_use, params_dro, G, AF, marks,
-                                    min_lb=min_lb, max_lb=max_lb, lam_shr=lam,
-                                    verbose=bool(verbose))
+    k_days = int(CONFIG["REBAL"]["rebalance_period_days"])
+    if k_days <= 0: raise ValueError("rebalance_period_days must be > 0.")
     
-    # --- DRO: build weights-on-dates from piecewise fit, then apply unified PnL helper ---
-    k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
-    tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
+    # 1) Rebalancing calendars
+    index_rebal, marks = make_index_rebal(full_index_fit, s, e, k_days)   # fixed schedule on FIT index
     
-    dro_rows = []
-    for dt, w in zip(rebal_dates_fit, fit_dro_pw["w_list"]):
-        if dt >= oos_start:
-            dro_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=R_use.columns, name=dt))
-    W_rebal_dro = pd.DataFrame(dro_rows).sort_index()
-        
-    dro_daily, W_daily_dro, W_eff_dro = pnl_with_delay_and_cost(
-        W_on_dates=W_rebal_dro,
-        full_index=full_index, R_df=R_oos,
-        delay=k_delay, tc=tc, name="DRO_daily",)
-
-    # --- rSLDS: build permissible tuples, verify in results_csv, pick BEST tuple per security ---
+    # 2) rSLDS labels (strict tuple selection) on both OOS and FIT calendars
     Z_labels     = {}
     Z_labels_fit = {}
     
-    # 3.1 permissible tuples from CONFIG
-    perm_tuples = _permissible_tuples_from_CONFIG(CONFIG)  # list of (config,K,D)
-    
-    # 3.2 hard-check that ALL permissible tuples exist in results_csv
-    present = _tuples_in_results_csv(df_res, perm_tuples)
-    missing = sorted(set(perm_tuples) - present)
+    perm_tuples = _permissible_tuples_from_CONFIG(CONFIG)      # list of (config,K,D)
+    present     = _tuples_in_results_csv(df_res, perm_tuples)
+    missing     = sorted(set(perm_tuples) - present)
     if missing:
-        raise RuntimeError(
-            "results_csv is missing REQUIRED rSLDS tuples: "
-            f"{missing}"
-        )
+        raise RuntimeError(f"results_csv is missing REQUIRED rSLDS tuples: {missing}")
     
-    # 3.3 restrict results to permissible tuples only (exact match on name,K,D)
     df_res_perm = df_res.copy()
     df_res_perm["config"]     = df_res_perm["config"].astype(str).str.strip()
     df_res_perm["n_regimes"]  = pd.to_numeric(df_res_perm["n_regimes"],  errors="coerce").astype("Int64")
@@ -2192,176 +2211,214 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
     )
     df_res_perm = df_res_perm[mask_perm]
     
-    # 3.4 for each security, choose BEST tuple and load labels STRICTLY by that tuple
-    for sec in px_cols:
-        best = _select_best_config(df_res_perm, sec)  # returns (config,K,D) or None
+    px_cols_req = [t for t in px_cols if t in map(str, px_all.columns)]
+    for sec in px_cols_req:
+        best = _select_best_config(df_res_perm, sec)
         if best is None:
-            print(f"[WARN] No winning tuple in results for {sec}; skipping.")
             continue
         c_name, K, D = best
-    
-        # labels must match exact tuple; function already enforces tuple match
         z_ser = _labels_from_segments_df(df_seg, sec, c_name, K, D)
         if z_ser is None:
-            print(f"[WARN] No segments for {sec} under {(c_name,K,D)}; skipping.")
             continue
-    
         Z_labels[sec]     = map_labels_to_calendar(z_ser, full_index)
         Z_labels_fit[sec] = map_labels_to_calendar(z_ser, full_index_fit)
     
-    avail = [t for t in px_cols if t in Z_labels]
-    if not avail:
-        raise RuntimeError("No assets produced rSLDS labels → cannot run RegDRO.")
-
-    _, taus = make_index_union(full_index,
-                               {k: np.asarray(v, float) for k, v in Z_labels.items()},
-                               s, e)
-    taus = [int(x) for x in taus]
-
-    params_reg = dict(CONFIG["DELTA_DEFAULTS"][CONFIG["PORTFOLIO"]["delta_name"]])
-    lookback = int(CONFIG["REBAL"]["max_lookback_days"])
-    min_obs  = int(CONFIG["REBAL"]["min_lookback_days"])
-
-    names_all = list(avail)
-    pos = {n:i for i,n in enumerate(names_all)}
-
-    if bool(verbose):
-        _section("RegDRO")
+    names_all = [t for t in px_cols_req if t in Z_labels]
+    if not names_all:
+        raise RuntimeError("No assets produced rSLDS labels → cannot run RegDRO / aligned MVO/DRO.")
     
-    w_list = []; delta_list = []
-    _cap_skips = 0
-    _cap_total = len(taus) - 1
+    # Event-based dates: union of regime changes on OOS calendar
+    _, taus = make_index_union(full_index, {k: np.asarray(v, float) for k, v in Z_labels.items()}, s, e)
+    taus = [int(x) for x in taus]
+    
+    params_reg = dict(CONFIG["DELTA_DEFAULTS"][CONFIG["PORTFOLIO"]["delta_name"]])   # for RegDRO
+    params_dro = dict(CONFIG["DELTA_DEFAULTS"][CONFIG["PORTFOLIO"]["delta_name"]])   # for DRO (unconditional)
+    
+    # 3) Solve on event dates (RegDRO; plus MVO/DRO event-based using the SAME context)
+    w_reg_list, del_reg_list, del_uncond_list, del_gap_list = [], [], [], []
+    w_evt_mvo_list, w_evt_dro_list = [], []
+
+    # --- cache for bootstrap-based δ per decision date (ignores mu when method permits) ---
+    delta_cache = {}
+    def _delta_uncond_cached(mu_u, Sig, X_win, params):
+        method = (params or {}).get("delta_method", "")
+        if method in ("bootstrap_np", "bootstrap_gaussian"):
+            # cache key ties to method, window size, Σ scale, and μ scale to avoid
+            # reusing δ across materially different windows that happen to share shape/counts
+            key = (method, Sig.shape,
+                int(np.isfinite(X_win).sum()),
+                float(np.trace(Sig)),
+                float(np.linalg.norm(mu_u)))
+            
+            if key not in delta_cache:
+                delta_cache[key] = compute_delta(params.get("kappa", 1.0), mu_u, Sig, R=X_win, params=params)
+            return float(delta_cache[key])
+        # fallback for κ-based or fixed methods
+        return float(compute_delta(params.get("kappa", 1.0), mu_u, Sig, R=X_win, params=params))
+
     for a, b in zip(taus[:-1], taus[1:]):
-
-        # Current decision date on OOS calendar and its position on the FIT calendar
+        # decision date is the segment start 'a' on OOS calendar
         t_mid = min(max(a, 0), len(full_index) - 1)
-        D     = full_index[t_mid]                    # decision date on OOS calendar
-        D_pos = full_index_fit.get_loc(D)            # corresponding position on FIT calendar
+        D     = full_index[t_mid]
+        D_pos = full_index_fit.get_loc(D)  # position on FIT calendar
 
-        # Lookback window on FIT calendar: [D_pos - lookback, D_pos)
-        a_win = max(0, D_pos - lookback)
-        b_win = D_pos
-        win_idx = full_index_fit.take(np.arange(a_win, b_win, dtype=int))
-
-        # Build keep list: asset must have a finite current label, and ≥ min_obs
-        # observations in the lookback with the SAME label as today AND finite returns.
-        keep, masks = [], []
-        for n in names_all:
-            z_ser = np.asarray(Z_labels_fit[n], dtype=float)
-            z_now = z_ser[D_pos]
-            if not np.isfinite(z_now):
-                continue
-            m = (z_ser[a_win:b_win] == z_now)  # same-regime mask in window
-            if not np.any(m):
-                continue
-            x = df_returns_full.loc[win_idx, n].to_numpy(float)
-            m = m & np.isfinite(x)
-            if int(m.sum()) >= min_obs:
-                keep.append(n)
-                masks.append(m)
-
-        if not keep:
-            if bool(verbose):
-                dt_str = getattr(D, 'date', lambda: D)()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: no qualifying assets)")
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan)
-            continue
-
-        # CAP FEASIBILITY (optional; unchanged logic)
-        c_max = float(CONFIG["PORTFOLIO"]["max_cash"])
-        u     = float(CONFIG["PORTFOLIO"]["max_pos_size"])
-        cap_applies = bool(G.get("no_shorting", False)) and np.isfinite(u) and (u > 0.0)
-        N_req  = int(np.ceil((1.0 - c_max) / max(u, 1e-12))) if cap_applies else 0
-        if cap_applies and (len(keep) < N_req):
-            if bool(verbose):
-                dt_str = getattr(D, 'date', lambda: D)()
-                print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta=nan  (skipped: <min sample for caps)")
-            _cap_skips += 1
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan)
-            continue
-
-        # Window matrix and conditional μ (per-asset, masked), unconditional Σ on kept assets
-        X_win_df = df_returns_full.loc[win_idx, keep]
-        AF = int(CONFIG.get("annualization_factor", 252))
-        mu = np.asarray([
-            compute_mean_from_window(X_win_df[[n]], masks[j], min_obs=min_obs, ann=AF)[0]
-            for j, n in enumerate(keep)
-        ], dtype=float)
-
-        lam = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
-        Sig = compute_cov_from_window(X_win_df[keep], ann=AF, shrink_lambda=lam, min_obs=min_obs)
-
-        # Solve DRO using the same window samples (for bootstrap-based δ methods)
-        X_win = X_win_df[keep].to_numpy(float)
-
-        Sig_np = np.atleast_2d(np.asarray(Sig, dtype=float))
-        if (not np.isfinite(mu).all()) or (not np.isfinite(Sig_np).all()):
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan);  continue
-        Sig_sym = 0.5 * (Sig_np + Sig_np.T)
-        ev = np.linalg.eigvalsh(Sig_sym)
-        if (ev.size == 0) or (not np.isfinite(ev).all()) or (ev.min() < -1e-10):
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan);  continue
-
-        w_sub, delta_k = solve_dro(mu, Sig, params_reg, G, R=X_win, verbose=bool(verbose))
-        if not np.isfinite(delta_k):
-            w_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
-            delta_list.append(np.nan);  continue
-
-        if bool(verbose):
-            dt_str = getattr(D, 'date', lambda: D)()
-            print(f"[RegDRO] t={D_pos} {dt_str}  seg=[{a},{b})  delta={float(delta_k):.4f}")
-            _print_mu_by_name(keep, mu)
-
-        w_full = np.zeros(len(names_all))
-        for j, n in enumerate(keep):
-            w_full[pos[n]] = w_sub[j]
-        w_list.append(w_full)
-        delta_list.append(float(delta_k))
+        ok, keep, pos_map, X_win_df, mu_cond, mu_uncond, Sig, X_win, mask_cond_all = regdro_decision_context(
+            D_pos=D_pos,
+            full_index_fit=full_index_fit,
+            df_returns_full=df_returns_full,
+            names_all=names_all,
+            Z_labels_fit=Z_labels_fit,
+            AF=AF,
+            min_obs=min_lb,
+            max_lb=max_lb,
+            lam_shr=lam,
+            G=G,)
         
+        if not ok:
+            w_reg_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            del_reg_list.append(np.nan); del_uncond_list.append(np.nan); del_gap_list.append(np.nan)
+            w_evt_mvo_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            w_evt_dro_list.append(np.asarray(_feasible_placeholder(len(names_all), G), float))
+            continue
+        
+        # RegDRO: conditional μ, unconditional Σ.
+        # Prefer δ from the in-regime panel, but if the intersection is empty,
+        # fall back to the full window for δ to avoid empty bootstrap samples.
+        use_cond = bool(mask_cond_all.size) and int(mask_cond_all.sum()) > 0
+        X_cond = X_win[mask_cond_all, :] if use_cond else X_win
+        w_reg_sub, delta_k = solve_dro(mu_cond, Sig, params_reg, G, R=X_cond, verbose=bool(verbose))
 
-    # --- CAP CHECK summary (percent skipped due to caps) ---
-    _cap_total = int(_cap_total)
-    if _cap_total <= 0:
-        print("\n[MIN SAMPLE CHECK SUMMARY] no regime segments -> nothing to check.")
-    else:
-        _cap_pct = 100.0 * float(_cap_skips) / float(_cap_total)
-        print(f"\n[MIN SAMPLE CHECK SUMMARY] skipped {_cap_skips}/{_cap_total} segments ({_cap_pct:.1f}%) due to <min sample.")
+        # Embed to full name list (O(1) via pos_map)
+        w_reg_full = np.zeros(len(names_all))
+        w_reg_sub_np = asnumpy_strict(w_reg_sub, float).ravel()
+        idxs = [pos_map[n] for n in keep]
+        w_reg_full[idxs] = w_reg_sub_np
+        w_reg_list.append(w_reg_full); del_reg_list.append(float(delta_k))
+          
+        # unconditional δ for reporting (same window, same keep)
+        try:
+            delta_uncond_k = _delta_uncond_cached(mu_uncond, Sig, X_win, params_reg)
+        except Exception:
+            delta_uncond_k = np.nan
+            
+        del_uncond_list.append(float(delta_uncond_k) if np.isfinite(delta_uncond_k) else np.nan)
+        del_gap_list.append((float(delta_uncond_k) - float(delta_k)) if (np.isfinite(delta_uncond_k) and np.isfinite(delta_k)) else np.nan)
+    
+        # Event-based MVO (unconditional μ, same Σ)
+        w_evt_mvo_sub = solve_optimizer(mu_uncond, Sig, delta=0.0, config=G, verbose=False)
+        w_evt_mvo = np.zeros(len(names_all))
+        w_evt_mvo_sub_np = asnumpy_strict(w_evt_mvo_sub, float).ravel()
+        idxs = [pos_map[n] for n in keep]
+        w_evt_mvo[idxs] = w_evt_mvo_sub_np
+        w_evt_mvo_list.append(w_evt_mvo)
+
+        # Event-based DRO — reuse cached δ when bootstrap method
+        delta_evt = _delta_uncond_cached(mu_uncond, Sig, X_win, params_dro)
+        w_evt_dro_sub = solve_optimizer(mu_uncond, Sig, delta_evt, config=G, verbose=False)
+        
+        w_evt_dro = np.zeros(len(names_all))
+        w_evt_dro_sub_np = asnumpy_strict(w_evt_dro_sub, float).ravel()
+        idxs = [pos_map[n] for n in keep]
+        w_evt_dro[idxs] = w_evt_dro_sub_np
+        w_evt_dro_list.append(w_evt_dro)
 
     fit_reg = {
         "type": "piecewise",
-        "w_list": [np.asarray(w, float) for w in w_list],
+        "w_list": [np.asarray(w, float) for w in w_reg_list],
         "segs":   np.asarray(taus, dtype=int),
         "names":  names_all,
-        "delta_list": [float(d) if np.isfinite(d) else np.nan for d in delta_list],
+        "delta_list":        [float(d) if np.isfinite(d) else np.nan for d in del_reg_list],
+        "delta_uncond_list": [float(d) if np.isfinite(d) else np.nan for d in del_uncond_list],
+        "delta_gap_list":    [float(d) if np.isfinite(d) else np.nan for d in del_gap_list],
     }
+    
+    fit_evt_mvo = {"type": "piecewise", "w_list": [np.asarray(w, float) for w in w_evt_mvo_list], "segs": np.asarray(taus, dtype=int)}
+    fit_evt_dro = {"type": "piecewise", "w_list": [np.asarray(w, float) for w in w_evt_dro_list], "segs": np.asarray(taus, dtype=int)}
+    
+    # 4) Fixed-schedule MVO/DRO — BUT use the *same* RegDRO-eligible universe per fixed date
+    w_fix_mvo_list, w_fix_dro_list = [], []
+    
+    for a, b in zip(marks[:-1], marks[1:]):
+        if a == 0:
+            w_fix_mvo_list.append(_feasible_placeholder(len(names_all), G))
+            w_fix_dro_list.append(_feasible_placeholder(len(names_all), G))
+            continue
+    
+        D_pos = int(a)
+        ok, keep, pos_map, X_win_df, mu_cond, mu_uncond, Sig, X_win, _ = regdro_decision_context(
+            D_pos=D_pos,
+            full_index_fit=full_index_fit,
+            df_returns_full=df_returns_full,
+            names_all=names_all,
+            Z_labels_fit=Z_labels_fit,
+            AF=AF,
+            min_obs=min_lb,
+            max_lb=max_lb,
+            lam_shr=lam,
+            G=G,)
 
-    # --- RegDRO: build weights-on-dates from union breaks, then apply unified PnL helper ---
+        if not ok:
+            w_fix_mvo_list.append(_feasible_placeholder(len(names_all), G))
+            w_fix_dro_list.append(_feasible_placeholder(len(names_all), G))
+            continue
+    
+        # MVO fixed (δ=0)
+        w_mvo_sub = solve_optimizer(mu_uncond, Sig, delta=0.0, config=G, verbose=False)
+        w_mvo = np.zeros(len(names_all))
+        w_mvo_sub_np = asnumpy_strict(w_mvo_sub, float).ravel()
+        idxs = [pos_map[n] for n in keep]
+        w_mvo[idxs] = w_mvo_sub_np
+        w_fix_mvo_list.append(w_mvo)
+        
+        # DRO fixed (unconditional δ on same window) — reuse cached δ when bootstrap method
+        delta_fix = _delta_uncond_cached(mu_uncond, Sig, X_win, params_dro)
+        w_dro_sub = solve_optimizer(mu_uncond, Sig, delta_fix, config=G, verbose=False)
+        w_dro = np.zeros(len(names_all))
+        w_dro_sub_np = asnumpy_strict(w_dro_sub, float).ravel()
+        idxs = [pos_map[n] for n in keep]
+        w_dro[idxs] = w_dro_sub_np
+        w_fix_dro_list.append(w_dro)
+
+    fit_fix_mvo = {"type": "piecewise", "w_list": [np.asarray(w, float) for w in w_fix_mvo_list], "segs": np.asarray(marks, dtype=int)}
+    fit_fix_dro = {"type": "piecewise", "w_list": [np.asarray(w, float) for w in w_fix_dro_list], "segs": np.asarray(marks, dtype=int)}
+    
+    # 5) Build weights-on-dates and PnL for the four strategies + RegDRO
     k_delay = int(CONFIG["EXECUTION"].get("execution_delay", 0))
     tc      = float(CONFIG["EXECUTION"].get("trading_cost", 0.0))
     
-    R_reg  = df_returns.loc[full_index, names_all]
-    taus   = [int(x) for x in fit_reg["segs"]]
+    # Helper to convert a piecewise fit to dated rows (keep only dates >= OOS start)
+    def _dated_rows_from_fit(fit, calendar, col_names):
+        rows = []
+        rebal_dates = calendar[np.asarray(fit["segs"], int)[:-1]]
+        oos_start = full_index[0]
+        for dt, w in zip(rebal_dates, fit["w_list"]):
+            if dt >= oos_start:
+                rows.append(pd.Series(asnumpy_strict(w, float).ravel(), index=col_names, name=dt))
+        return pd.DataFrame(rows).sort_index()
     
-    reg_rows = []
-    for dt, w in zip(full_index[taus[:-1]], fit_reg["w_list"]):
-        reg_rows.append(pd.Series(asnumpy_strict(w, dtype=float), index=names_all, name=dt))
-    W_on_dates_reg = pd.DataFrame(reg_rows).sort_index()
+    R_oos_names = names_all
+    R_oos_panel = df_returns.loc[full_index, R_oos_names]
     
-    regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(
-        W_on_dates=W_on_dates_reg,
-        full_index=full_index, R_df=R_reg,
-        delay=k_delay, tc=tc, name="RegDRO_daily",)
+    W_on_dates_reg   = _dated_rows_from_fit(fit_reg,     full_index,     R_oos_names)
+    W_on_dates_evt_m = _dated_rows_from_fit(fit_evt_mvo, full_index,     R_oos_names)
+    W_on_dates_evt_d = _dated_rows_from_fit(fit_evt_dro, full_index,     R_oos_names)
+    W_on_dates_fix_m = _dated_rows_from_fit(fit_fix_mvo, full_index_fit, R_oos_names)
+    W_on_dates_fix_d = _dated_rows_from_fit(fit_fix_dro, full_index_fit, R_oos_names)
+    
+    regdro_daily, W_daily_reg, W_eff_reg = pnl_with_delay_and_cost(W_on_dates_reg,   full_index, R_oos_panel, k_delay, tc, "RegDRO_daily")
+    mvo_evt_daily, W_daily_me, W_eff_me  = pnl_with_delay_and_cost(W_on_dates_evt_m, full_index, R_oos_panel, k_delay, tc, "MVO_event_daily")
+    dro_evt_daily, W_daily_de, W_eff_de  = pnl_with_delay_and_cost(W_on_dates_evt_d, full_index, R_oos_panel, k_delay, tc, "DRO_event_daily")
+    mvo_fix_daily, W_daily_mf, W_eff_mf  = pnl_with_delay_and_cost(W_on_dates_fix_m, full_index, R_oos_panel, k_delay, tc, "MVO_fixed_daily")
+    dro_fix_daily, W_daily_df, W_eff_df  = pnl_with_delay_and_cost(W_on_dates_fix_d, full_index, R_oos_panel, k_delay, tc, "DRO_fixed_daily")
 
-    # report weights
+    # Monthly holdings snapshots
     me_idx = _period_ends(full_index, "M")
-    H_mvo = W_eff_mvo.reindex(me_idx).ffill().rename_axis("date")
-    H_dro = W_eff_dro.reindex(me_idx).ffill().rename_axis("date")
     H_reg = W_eff_reg.reindex(me_idx).ffill().rename_axis("date")
-
+    H_mvo_fix = W_eff_mf.reindex(me_idx).ffill().rename_axis("date")
+    H_dro_fix = W_eff_df.reindex(me_idx).ffill().rename_axis("date")
+    H_mvo_evt = W_eff_me.reindex(me_idx).ffill().rename_axis("date")
+    H_dro_evt = W_eff_de.reindex(me_idx).ffill().rename_axis("date")
+    
     # ===== OOS summaries (strict s:e window) =====
     def _summ_from_series(series, G, AF, n_days):
         x = series.to_numpy(float)
@@ -2377,264 +2434,194 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
             "vol_breach": max(sig - G["risk_budget"], 0.0),
             "max_dd": _max_drawdown_from_series(x)
         }
-
+    
     AF = int(CONFIG.get("annualization_factor", 252))
     n_aligned = len(full_index)
     spx_daily = spx_daily.reindex(full_index).fillna(0.0)
-
-    # Point estimates first
-    rows_mvo = dict(_summ_from_series(mvo_daily,    G, AF, n_aligned))
-    rows_dro = dict(_summ_from_series(dro_daily,    G, AF, n_aligned))
-    rows_reg = dict(_summ_from_series(regdro_daily, G, AF, n_aligned))
-    rows_spx = dict(_summ_from_series(spx_daily,    G, AF, n_aligned))
-
+    
+    rows_mvo_fix = dict(_summ_from_series(mvo_fix_daily, G, AF, n_aligned))
+    rows_dro_fix = dict(_summ_from_series(dro_fix_daily, G, AF, n_aligned))
+    rows_mvo_evt = dict(_summ_from_series(mvo_evt_daily, G, AF, n_aligned))
+    rows_dro_evt = dict(_summ_from_series(dro_evt_daily, G, AF, n_aligned))
+    rows_reg     = dict(_summ_from_series(regdro_daily,  G, AF, n_aligned))
+    rows_spx     = dict(_summ_from_series(spx_daily,     G, AF, n_aligned))
+    
     # Gross exposure (point)
     a_oos = full_index_fit.get_loc(full_index[0])
     b_oos = full_index_fit.get_loc(full_index[-1]) + 1
     win_oos = (a_oos, b_oos)
     T_req = len(full_index)
-    rows_mvo["gross_exp"] = _gross_exp_on_window(fit_mvo,    T_req, win=win_oos)
-    rows_dro["gross_exp"] = _gross_exp_on_window(fit_dro_pw, T_req, win=win_oos)
-    rows_reg["gross_exp"] = _gross_exp_on_window(fit_reg,    T_req)   # already aligned
-
-    # Deltas: blank for MVO & SPX; aggregated for DRO & RegDRO
+    rows_mvo_fix["gross_exp"] = _gross_exp_on_window(fit_fix_mvo, T_req, win=win_oos)
+    rows_dro_fix["gross_exp"] = _gross_exp_on_window(fit_fix_dro, T_req, win=win_oos)
+    rows_mvo_evt["gross_exp"] = _gross_exp_on_window(fit_evt_mvo, T_req)
+    rows_dro_evt["gross_exp"] = _gross_exp_on_window(fit_evt_dro, T_req)
+    rows_reg["gross_exp"]     = _gross_exp_on_window(fit_reg,     T_req)
     
-    for k in ("delta_mean","delta_min","delta_max"):
-        rows_mvo[k] = float("nan")
-        rows_spx[k] = float("nan")
+    # Deltas
+    for rows in (rows_mvo_fix, rows_mvo_evt, rows_dro_evt, rows_spx):
+        rows["delta"] = float("nan"); rows["delta_uncond"] = float("nan"); rows["delta_gap"] = float("nan")
     
-    if len(fit_dro_pw.get("delta_list", [])):
-        d = pd.Series([float(x) for x in fit_dro_pw["delta_list"] if np.isfinite(x)])
-        rows_dro["delta_mean"] = float(d.mean()) if len(d) else np.nan
-        rows_dro["delta_min"]  = float(d.min())  if len(d) else np.nan
-        rows_dro["delta_max"]  = float(d.max())  if len(d) else np.nan
+    # DRO fixed/event: δ is unconditional by construction (average over dates)
+    def _avg_list_delta(fit, params):
+        # recompute average δ using same windows used for that fit
+        segs = [int(x) for x in fit["segs"]]
+        if len(segs) <= 1: return np.nan
+        dlst = []
+        for a, b in zip(segs[:-1], segs[1:]):
+            D_pos = int(a)
+            ok, keep, _, X_win_df, mu_cond, mu_uncond, Sig, X_win, _ = regdro_decision_context(
+                D_pos=D_pos, full_index_fit=full_index_fit, df_returns_full=df_returns_full,
+                names_all=names_all, Z_labels_fit=Z_labels_fit, AF=AF,
+                min_obs=min_lb, max_lb=max_lb, lam_shr=lam, G=G)
 
-    if len(fit_reg.get("delta_list", [])):
-        d = pd.Series([float(x) for x in fit_reg["delta_list"] if np.isfinite(x)])
-        rows_reg["delta_mean"] = float(d.mean()) if len(d) else np.nan
-        rows_reg["delta_min"]  = float(d.min())  if len(d) else np.nan
-        rows_reg["delta_max"]  = float(d.max())  if len(d) else np.nan
-
-    # initialize to NaN for all four strategies
-    for rows in (rows_mvo, rows_spx, rows_dro, rows_reg):
-        rows["delta_pooled"] = float("nan")
-        rows["delta_within"] = float("nan")
-        rows["delta_between"] = float("nan")
-        rows["delta_within_between"] = float("nan")
-
-    lam    = float(CONFIG["PORTFOLIO"]["sigma_shrinkage_lambda"])
-    min_lb = int(CONFIG["REBAL"]["min_lookback_days"])
-
-    # --- guards (no try/except) ---
-    def _ok_panel(R_df, min_obs):
-        X = R_df.to_numpy(float)
-        row_ok = np.isfinite(X).all(axis=1)
-        return int(row_ok.sum()) >= int(min_obs)
+            if not ok: continue
+            try:
+                dlst.append(float(_delta_uncond_cached(mu_uncond, Sig, X_win, params)))
+            except Exception:
+                pass
+        return float(np.nanmean(dlst)) if len(dlst) else np.nan
     
-    def _segment_lengths_ok(taus_vec):
-        K = max(0, len(taus_vec) - 1)
-        if K <= 0:
-            return False, np.array([], dtype=int)
-        seg_lengths = np.diff(np.array(taus_vec, dtype=int))
-        return bool(np.all(seg_lengths > 0)), seg_lengths
+    delta_dro_fix = _avg_list_delta(fit_fix_dro, params_dro)
+    delta_dro_evt = _avg_list_delta(fit_evt_dro, params_dro)
     
-    # Helper: pooled delta on a panel R_df with the same delta config
-    def _pooled_delta(R_df, params_delta):
-        mask_all = np.ones(R_df.shape[0], dtype=bool)
-        mu_full  = compute_mean_from_window(R_df, mask_all, min_obs=min_lb, ann=AF)
-        Sig_full = compute_cov_from_window(R_df, ann=AF, shrink_lambda=lam, min_obs=min_lb)
-        return compute_delta(params_delta.get("kappa", 1.0),
-                             mu_full, Sig_full,
-                             R=R_df.to_numpy(float),
-                             params=params_delta)
-
-    # 2.1 DRO: δ_pooled on the unconditional OOS panel (matching the DRO asset set)
-    if _ok_panel(R_oos, min_lb):
-        rows_dro["delta_pooled"] = float(_pooled_delta(R_oos, params_dro))
-    else:
-        rows_dro["delta_pooled"] = float("nan")
-
-    # 2.2 RegDRO: δ_pooled, δ_within, δ_between (on the RegDRO asset set)
-    R_reg_df = R_reg  # (OOS window, names_all)
-    params_reg_local = dict(params_reg)
+    rows_dro_fix["delta"] = delta_dro_fix
+    rows_dro_fix["delta_uncond"] = delta_dro_fix
+    rows_dro_fix["delta_gap"] = 0.0
     
-    # δ_pooled (same method as DRO but on the RegDRO asset set)
-    if _ok_panel(R_reg_df, min_lb):
-        rows_reg["delta_pooled"] = float(_pooled_delta(R_reg_df, params_reg_local))
-    else:
-        rows_reg["delta_pooled"] = float("nan")
+    rows_dro_evt["delta"] = delta_dro_evt
+    rows_dro_evt["delta_uncond"] = delta_dro_evt
+    rows_dro_evt["delta_gap"] = 0.0
     
-    # segment length checks
-    ok_segs, seg_lengths = _segment_lengths_ok(taus)
+    # RegDRO deltas (conditional vs unconditional)
+    d_cond   = np.asarray(fit_reg.get("delta_list", []), dtype=float)
+    d_uncond = np.asarray(fit_reg.get("delta_uncond_list", []), dtype=float)
+    d_gap    = np.asarray(fit_reg.get("delta_gap_list", []), dtype=float)
+    rows_reg["delta"]        = float(np.nanmean(d_cond))   if d_cond.size   else np.nan
+    rows_reg["delta_uncond"] = float(np.nanmean(d_uncond)) if d_uncond.size else np.nan
+    rows_reg["delta_gap"]    = float(np.nanmean(d_gap))    if d_gap.size    else (rows_reg["delta_uncond"] - rows_reg["delta"] if (np.isfinite(rows_reg["delta_uncond"]) and np.isfinite(rows_reg["delta"])) else np.nan)
     
-    if ok_segs:
-        total_len = float(seg_lengths.sum())
-        pi = seg_lengths / total_len if total_len > 0 else np.zeros_like(seg_lengths, dtype=float)
-
-        method = str(params_reg_local.get("delta_method", "bootstrap_np")).lower()
-        use_gaussian = ("gaussian" in method)
-        n_proj = int(params_reg_local.get("n_proj", 128))
-
-        # ---- δ_within (permit short segments; renormalize π to the kept set) ----
-        delta_k, pi_valid = [], []
-        for (a_, b_), w_k in zip(zip(taus[:-1], taus[1:]), pi):
-            Xk_df = R_reg_df.iloc[a_:b_, :]
-            seg_n = int(Xk_df.shape[0])
-            if seg_n < 2:
-                continue
-        
-            # Require at least 2 all-finite rows to satisfy estimators without try/except
-            Xk = Xk_df.to_numpy(float)
-            row_ok = np.isfinite(Xk).all(axis=1)
-            if int(row_ok.sum()) < 2:
-                continue
-        
-            if method.startswith("bootstrap"):
-                # For bootstrap_* methods μ,Σ are placeholders (ignored by compute_delta)
-                mu_k  = np.zeros(Xk_df.shape[1], dtype=float)
-                Sig_k = np.eye(Xk_df.shape[1], dtype=float)
-            else:
-                # Use only all-finite rows
-                mu_k  = compute_mean_from_window(Xk_df, row_ok, min_obs=2, ann=AF)
-                Sig_k = compute_cov_from_window(Xk_df.loc[row_ok], ann=AF, shrink_lambda=lam, min_obs=2)
-        
-            dk = compute_delta(
-                params_reg_local.get("kappa", 1.0),
-                mu_k, Sig_k,
-                R=Xk_df.to_numpy(float),
-                params=params_reg_local
-            )
-        
-            if np.isfinite(dk):
-                delta_k.append(float(dk))
-                pi_valid.append(float(w_k))
-        
-        if len(delta_k) >= 1 and np.sum(pi_valid) > 0:
-            pi_valid = np.asarray(pi_valid, float)
-            pi_valid = pi_valid / float(np.sum(pi_valid))
-            rows_reg["delta_within"] = float(np.sqrt(np.sum(pi_valid * (np.asarray(delta_k) ** 2))))
-
-    # Bench-relative point estimates (only for strategy columns)
+    # Bench-relative point estimates
     def _bench_stats(port, bench, AF=252):
         ex = (port - bench).dropna()
         if ex.empty: return float("nan"), float("nan"), float("nan")
-        alpha = AF * ex.mean()
-        te    = (AF ** 0.5) * ex.std(ddof=1)
-        ir    = alpha / te if (np.isfinite(te) and te != 0) else float("nan")
+        alpha = AF * ex.mean(); te = (AF ** 0.5) * ex.std(ddof=1); ir = alpha / te if (np.isfinite(te) and te != 0) else float("nan")
         return float(alpha), float(te), float(ir)
-
-    for rows, ser in ((rows_mvo, mvo_daily), (rows_dro, dro_daily), (rows_reg, regdro_daily)):
+    
+    for rows, ser in ((rows_mvo_fix, mvo_fix_daily), (rows_dro_fix, dro_fix_daily), (rows_mvo_evt, mvo_evt_daily), (rows_dro_evt, dro_evt_daily), (rows_reg, regdro_daily)):
         a, te, ir = _bench_stats(ser, spx_daily, AF)
-        rows["alpha_ann"] = a
-        rows["te_ann"]    = te
-        rows["ir_ann"]        = ir
-
-    # SPX presentation rules (no bench-relative, no deltas, vol_breach blank, ge=1)
-    rows_spx["alpha_ann"]  = float("nan")
-    rows_spx["te_ann"]     = float("nan")
-    rows_spx["ir_ann"]         = float("nan")
-    rows_spx["hit_rate"] = float("nan")
-    rows_spx["vol_breach"]        = float("nan")
-    rows_spx["gross_exp"]         = 1.0
-
-    # Hit-rate vs bench (point): P(port >= bench) on overlapping days
+        rows["alpha_ann"] = a; rows["te_ann"] = te; rows["ir_ann"] = ir
+    
+    # SPX presentation
+    rows_spx["alpha_ann"] = rows_spx["te_ann"] = rows_spx["ir_ann"] = rows_spx["hit_rate"] = float("nan")
+    rows_spx["vol_breach"] = float("nan"); rows_spx["gross_exp"] = 1.0
+    # Hit-rate vs SPX
     def _hit_rate(port, bench):
         m = pd.Series(np.isfinite(port) & np.isfinite(bench), index=port.index)
         if not m.any(): return float("nan")
         return float(((port[m] - bench[m]) >= 0.0).mean())
-
-    rows_mvo["hit_rate"] = _hit_rate(mvo_daily, spx_daily)
-    rows_dro["hit_rate"] = _hit_rate(dro_daily, spx_daily)
-    rows_reg["hit_rate"] = _hit_rate(regdro_daily, spx_daily)
-    # SPX left blank by rule
     
-    # --- Jackknife (strategies only) ---
-    if run_jackknife:
-        JK = dict(CONFIG.get("JACKKNIFE", {}))
-        d_jk    = int(JK.get("d", 0))
-        seed_jk = JK.get("seed", None)
-        if d_jk <= 0:
-            raise ValueError("CONFIG['JACKKNIFE']['d'] must be set and positive.")
+    rows_mvo_fix["hit_rate"] = _hit_rate(mvo_fix_daily, spx_daily)
+    rows_dro_fix["hit_rate"] = _hit_rate(dro_fix_daily, spx_daily)
+    rows_mvo_evt["hit_rate"] = _hit_rate(mvo_evt_daily, spx_daily)
+    rows_dro_evt["hit_rate"] = _hit_rate(dro_evt_daily, spx_daily)
+    rows_reg["hit_rate"]     = _hit_rate(regdro_daily,  spx_daily)
 
-        bb = jackknife_universe_oos(
-            securities=names_all,
-            CONFIG=CONFIG,
-            d=d_jk,
-            alpha=0.05,      # fixed confidence level for intervals
-            seed=seed_jk,
-        )
-        
-        # apply jackknife-based intervals
-        def _apply_ci(rows: dict, ci_dict: dict):
-            for k, trip in ci_dict.items():
-                if k in rows:
-                    rows[f"{k}_ci_low"]  = trip["ci_low"]
-                    rows[f"{k}_ci_high"] = trip["ci_high"]
-            return rows
-
-        rows_mvo = _apply_ci(rows_mvo, bb["ci"]["MVO"])
-        rows_dro = _apply_ci(rows_dro, bb["ci"]["DRO"])
-        rows_reg = _apply_ci(rows_reg, bb["ci"]["RegDRO"])
-
-        # mean/std across jackknife samples
-        def _apply_ms(rows: dict, ms_dict: dict):
-            for k, ms in ms_dict.items():
-                if k in rows:
-                    rows[f"{k}_mean_boot"] = ms["mean"]
-                    rows[f"{k}_std_boot"]  = ms["std"]
-            return rows
-
-        rows_mvo = _apply_ms(rows_mvo, bb["mean_std"]["MVO"])
-        rows_dro = _apply_ms(rows_dro, bb["mean_std"]["DRO"])
-        rows_reg = _apply_ms(rows_reg, bb["mean_std"]["RegDRO"])
+    # Assemble DataFrames for the table (no jackknife applied here to keep patch concise)
+    df_mvo_fix = pd.DataFrame([rows_mvo_fix])
+    df_dro_fix = pd.DataFrame([rows_dro_fix])
+    df_mvo_evt = pd.DataFrame([rows_mvo_evt])
+    df_dro_evt = pd.DataFrame([rows_dro_evt])
+    df_reg     = pd.DataFrame([rows_reg])
+    df_spx     = pd.DataFrame([rows_spx])
     
-    # SPX: no CIs by rule
+    # --- build results_dict only for requested models (+ SPX benchmark) ---
+    results_dict = {}
+    if "MVO_fixed" in models_set:
+        results_dict["MVO_fixed"] = df_mvo_fix
+    if "DRO_fixed" in models_set:
+        results_dict["DRO_fixed"] = df_dro_fix
+    if "MVO_event" in models_set:
+        results_dict["MVO_event"] = df_mvo_evt
+    if "DRO_event" in models_set:
+        results_dict["DRO_event"] = df_dro_evt
+    if "RegDRO" in models_set:
+        results_dict["RegDRO"] = df_reg
 
-    # Assemble DataFrames for the table
-    df_mvo = pd.DataFrame([rows_mvo])
-    df_dro = pd.DataFrame([rows_dro])
-    df_reg = pd.DataFrame([rows_reg])
-    df_spx = pd.DataFrame([rows_spx])
-
-    results_dict = {"MVO": df_mvo, "DRO": df_dro, "RegDRO": df_reg, "SPX": df_spx}
-
-    # print once: outside bootstrap, or only on last bootstrap iteration
+    # SPX always in results for comparison
+    results_dict["SPX"] = df_spx
+    
+    # print once (respect bootstrap flag)
     show_table = True
     _boot = CONFIG.get("__bootstrap_run", {})
-    IN_BOOT = bool(_boot.get("active", False))
-
-    if IN_BOOT:
-        verbose = False
-        
-    if IN_BOOT:
-        BOOT_I = int(_boot.get("i", -1))
-        BOOT_B = int(_boot.get("B", -1))
-        show_table = (BOOT_I == BOOT_B - 1)
+    if bool(_boot.get("active", False)):
+        show_table = (int(_boot.get("i", -1)) == int(_boot.get("B", -1)) - 1)
     
     if show_table:
-        print_oos_table(results_dict, model_order=["MVO", "DRO", "RegDRO", "SPX"])
-
+        # order: requested models in canonical order, then SPX
+        base_order = [m for m in ["MVO_fixed", "DRO_fixed", "MVO_event", "DRO_event", "RegDRO"]
+                      if m in results_dict]
+        if "SPX" in results_dict:
+            base_order.append("SPX")
+        print_oos_table(results_dict, model_order=base_order)
+    
     # outputs
-    out = {
-        "MVO":     {"fit": fit_mvo,     "summary": rows_mvo},
-        "DRO":     {"fit": fit_dro_pw,  "summary": rows_dro},
-        "RegDRO":  {"fit": fit_reg,     "summary": rows_reg,
-                    "global_segs": [int(x) for x in fit_reg["segs"]],
-                    "Z_labels": {k: np.asarray(v) for k, v in Z_labels.items()}},
-        "SPX":     {"series": spx_daily, "summary": rows_spx},
-        "returns": df_returns,
-        "series": {
-            "MVO_daily": mvo_daily,
-            "DRO_daily": dro_daily,
-            "RegDRO_daily": regdro_daily,
-            "SPX_daily": spx_daily,
-        },
-        "securities": names_all,
-        "G": G,
-        "holdings": {"MVO": H_mvo, "DRO": H_dro, "RegDRO": H_reg},
-    }
+    out = {}
+
+    # Per-model blocks only if requested
+    if "MVO_fixed" in models_set:
+        out["MVO_fixed"] = {"fit": fit_fix_mvo, "summary": rows_mvo_fix}
+    if "DRO_fixed" in models_set:
+        out["DRO_fixed"] = {"fit": fit_fix_dro, "summary": rows_dro_fix}
+    if "MVO_event" in models_set:
+        out["MVO_event"] = {"fit": fit_evt_mvo, "summary": rows_mvo_evt}
+    if "DRO_event" in models_set:
+        out["DRO_event"] = {"fit": fit_evt_dro, "summary": rows_dro_evt}
+    if "RegDRO" in models_set:
+        out["RegDRO"] = {
+            "fit": fit_reg,
+            "summary": rows_reg,
+            "global_segs": [int(x) for x in fit_reg["segs"]],
+            "Z_labels": {k: np.asarray(v) for k, v in Z_labels.items()},
+        }
+
+    # SPX and shared artifacts always returned
+    out["SPX"] = {"series": spx_daily, "summary": rows_spx}
+    out["returns"] = df_returns
+
+    # Time series: only requested models + SPX
+    series_dict = {}
+    if "MVO_fixed" in models_set:
+        series_dict["MVO_fixed_daily"] = mvo_fix_daily
+    if "DRO_fixed" in models_set:
+        series_dict["DRO_fixed_daily"] = dro_fix_daily
+    if "MVO_event" in models_set:
+        series_dict["MVO_event_daily"] = mvo_evt_daily
+    if "DRO_event" in models_set:
+        series_dict["DRO_event_daily"] = dro_evt_daily
+    if "RegDRO" in models_set:
+        series_dict["RegDRO_daily"] = regdro_daily
+    series_dict["SPX_daily"] = spx_daily
+    out["series"] = series_dict
+
+    out["securities"] = names_all
+    out["G"] = G
+
+    # Holdings: only requested models
+    holdings_dict = {}
+    if "MVO_fixed" in models_set:
+        holdings_dict["MVO_fixed"] = H_mvo_fix
+    if "DRO_fixed" in models_set:
+        holdings_dict["DRO_fixed"] = H_dro_fix
+    if "MVO_event" in models_set:
+        holdings_dict["MVO_event"] = H_mvo_evt
+    if "DRO_event" in models_set:
+        holdings_dict["DRO-event"] = H_dro_evt   # keep original key name
+    if "RegDRO" in models_set:
+        holdings_dict["RegDRO"] = H_reg
+    out["holdings"] = holdings_dict
 
     if "dro_pickle" in CONFIG and CONFIG["dro_pickle"]:
         save_out(out, CONFIG["dro_pickle"])
 
     return out
+
