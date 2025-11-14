@@ -1314,6 +1314,9 @@ def jackknife_universe_oos(
     - permute securities once
     - for each block b, drop that block, run dro_pipeline on remaining names
     - aggregate metrics across jackknife samples (quantiles + mean/std)
+
+    Note: uses current dro_pipeline model names:
+          "MVO_fixed", "DRO_fixed", "RegDRO".
     """
     artifacts = _load_artifacts_cached(CONFIG)
 
@@ -1343,7 +1346,9 @@ def jackknife_universe_oos(
         "delta","delta_uncond","delta_gap",
     ]
 
-    buckets = {s: {k: [] for k in METRICS} for s in ("MVO", "DRO", "RegDRO")}
+    # Use current dro_pipeline keys
+    STRATS = ("MVO_fixed", "DRO_fixed", "RegDRO")
+    buckets = {s: {k: [] for k in METRICS} for s in STRATS}
 
     for b in range(n_blocks):
         start = b * d
@@ -1369,7 +1374,9 @@ def jackknife_universe_oos(
             artifacts=artifacts,
         )
 
-        for strat in ("MVO", "DRO", "RegDRO"):
+        for strat in STRATS:
+            if strat not in res:
+                continue
             row = res[strat]["summary"]
             for k in METRICS:
                 buckets[strat][k].append(float(row.get(k, np.nan)))
@@ -1383,6 +1390,7 @@ def jackknife_universe_oos(
     ms = {s: _aggregate_mean_std(buckets[s]) for s in buckets}
 
     return {"ci": ci, "mean_std": ms}
+
 
 # ---------------------------------------------------------------
 # Reporting
@@ -2549,13 +2557,44 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
 
     # SPX always in results for comparison
     results_dict["SPX"] = df_spx
-    
+
+    # Optionally run universe jackknife and inject CIs
+    jack_ci = None
+    if run_jackknife and not IN_BOOT:
+        jk_cfg = CONFIG.get("JACKKNIFE", {})
+        d_block = int(jk_cfg.get("d", 0))
+        if d_block <= 0:
+            raise ValueError("CONFIG['JACKKNIFE']['d'] must be positive when run_jackknife=True.")
+        alpha_jk = float(jk_cfg.get("alpha", 0.05))
+        seed_jk = jk_cfg.get("seed", None)
+
+        # jackknife over the actual investable universe (names_all)
+        jk = jackknife_universe_oos(
+            securities=names_all,
+            CONFIG=CONFIG,
+            d=d_block,
+            alpha=alpha_jk,
+            seed=seed_jk,)
+        
+        jack_ci = jk.get("ci", {})
+
+        # Add *_ci_low / *_ci_high columns to result DataFrames
+        for strat_name, ci_metrics in jack_ci.items():
+            if strat_name not in results_dict:
+                continue
+            df = results_dict[strat_name]
+            for metric, agg in ci_metrics.items():
+                lo = agg.get("ci_low", np.nan)
+                hi = agg.get("ci_high", np.nan)
+                df[f"{metric}_ci_low"] = [lo]
+                df[f"{metric}_ci_high"] = [hi]
+
     # print once (respect bootstrap flag)
     show_table = True
     _boot = CONFIG.get("__bootstrap_run", {})
     if bool(_boot.get("active", False)):
         show_table = (int(_boot.get("i", -1)) == int(_boot.get("B", -1)) - 1)
-    
+
     if show_table:
         # order: requested models in canonical order, then SPX
         base_order = [m for m in ["MVO_fixed", "DRO_fixed", "MVO_event", "DRO_event", "RegDRO"]
@@ -2563,7 +2602,7 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
         if "SPX" in results_dict:
             base_order.append("SPX")
         print_oos_table(results_dict, model_order=base_order)
-    
+
     # outputs
     out = {}
 
@@ -2619,6 +2658,16 @@ def dro_pipeline(securities, CONFIG, verbose=True, run_jackknife=False, artifact
     if "RegDRO" in models_set:
         holdings_dict["RegDRO"] = H_reg
     out["holdings"] = holdings_dict
+
+    # Attach jackknife CIs to the summary dicts as well
+    if jack_ci is not None:
+        for strat_name, ci_metrics in jack_ci.items():
+            if strat_name not in out:
+                continue
+            summ = out[strat_name]["summary"]
+            for metric, agg in ci_metrics.items():
+                summ[f"{metric}_ci_low"] = float(agg.get("ci_low", np.nan))
+                summ[f"{metric}_ci_high"] = float(agg.get("ci_high", np.nan))
 
     if "dro_pickle" in CONFIG and CONFIG["dro_pickle"]:
         save_out(out, CONFIG["dro_pickle"])
